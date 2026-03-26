@@ -167,7 +167,7 @@ Validated inside ROCm container on Radeon 890M (gfx1150): **84/84 tests passed**
 
 | Step | Action | GPU? | Status |
 |------|--------|------|--------|
-| 2.1 | `torch.compile(mode="default")` spike on ROCm | Yes | **Next** — pass/fail determines Phase 3 feasibility |
+| 2.1 | `torch.compile(mode="default")` spike on ROCm | Yes | ✅ Both `default` and `reduce-overhead` pass, 1.17x speedup, perfect eager parity |
 | 2.2 | KV cache test parametrization — add `device` fixture to `test_kv_cache.py` (basic update, nibble packing, VRAM savings) | Yes | Not started |
 
 **Session 2 — Coverage & hardening:**
@@ -196,7 +196,7 @@ Validated inside ROCm container on Radeon 890M (gfx1150): **84/84 tests passed**
 
 **Known limitations:**
 - ~11-16x slower than RTX 4090 (DDR5 ~90 GB/s vs GDDR6X ~1 TB/s)
-- `torch.compile` `reduce-overhead` mode broken on ROCm — must use `mode="default"`
+- `torch.compile` works on ROCm 7.1 (both `default` and `reduce-overhead` modes pass with TurboQuant ops, 1.17x speedup)
 - Fused Triton kernel (P3b/P5) is NVIDIA-only; requires porting or alternative approach
 - `hipMallocManaged()` not supported on gfx1150 as of ROCm 7.2
 
