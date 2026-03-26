@@ -13,15 +13,15 @@ from .conftest import BITS, DIM
 class TestKVCache:
     """Validate KV cache wrapper integration with HuggingFace DynamicCache."""
 
-    def test_basic_update(self) -> None:
+    def test_basic_update(self, device: torch.device) -> None:
         """Wrapped cache should accept and return correct tensor shapes."""
         from transformers import DynamicCache
 
         cache = DynamicCache()
         _ = TurboQuantKVCache(cache, head_dim=DIM, bits=BITS)
 
-        keys = torch.randn(1, 8, 1, DIM)
-        values = torch.randn(1, 8, 1, DIM)
+        keys = torch.randn(1, 8, 1, DIM).to(device)
+        values = torch.randn(1, 8, 1, DIM).to(device)
 
         out_k, out_v = cache.update(keys, values, layer_idx=0)
         assert out_k.shape[-1] == DIM
@@ -87,7 +87,7 @@ class TestKVCache:
         # Values should be different (compressed then decompressed)
         assert not torch.allclose(out_v[:, :, -1:, :], values, atol=1e-6)
 
-    def test_multi_layer_accumulation(self) -> None:
+    def test_multi_layer_accumulation(self, device: torch.device) -> None:
         """Cache should accumulate tokens across multiple update calls."""
         from transformers import DynamicCache
 
@@ -95,8 +95,8 @@ class TestKVCache:
         _ = TurboQuantKVCache(cache, head_dim=DIM, bits=BITS)
 
         for _ in range(3):
-            keys = torch.randn(1, 4, 1, DIM)
-            values = torch.randn(1, 4, 1, DIM)
+            keys = torch.randn(1, 4, 1, DIM).to(device)
+            values = torch.randn(1, 4, 1, DIM).to(device)
             out_k, out_v = cache.update(keys, values, layer_idx=0)
 
         assert out_k.shape[2] == 3
@@ -126,21 +126,21 @@ class TestKVCache:
 class TestCompressedDynamicCache:
     """Validate CompressedDynamicCache with real VRAM savings."""
 
-    def test_basic_update(self) -> None:
+    def test_basic_update(self, device: torch.device) -> None:
         """Wrapped cache should accept and return correct tensor shapes."""
         from transformers import DynamicCache
 
         cache = DynamicCache()
         _ = CompressedDynamicCache(cache, head_dim=DIM, bits=BITS)
 
-        keys = torch.randn(1, 8, 1, DIM)
-        values = torch.randn(1, 8, 1, DIM)
+        keys = torch.randn(1, 8, 1, DIM).to(device)
+        values = torch.randn(1, 8, 1, DIM).to(device)
 
         out_k, out_v = cache.update(keys, values, layer_idx=0)
         assert out_k.shape == (1, 8, 1, DIM)
         assert out_v.shape == (1, 8, 1, DIM)
 
-    def test_multi_token_prefill(self) -> None:
+    def test_multi_token_prefill(self, device: torch.device) -> None:
         """Prefill with multiple tokens should compress and dequantize all."""
         from transformers import DynamicCache
 
@@ -148,22 +148,22 @@ class TestCompressedDynamicCache:
         _ = CompressedDynamicCache(cache, head_dim=DIM, bits=BITS)
 
         seq_len = 64
-        keys = torch.randn(1, 4, seq_len, DIM)
-        values = torch.randn(1, 4, seq_len, DIM)
+        keys = torch.randn(1, 4, seq_len, DIM).to(device)
+        values = torch.randn(1, 4, seq_len, DIM).to(device)
 
         out_k, out_v = cache.update(keys, values, layer_idx=0)
         assert out_k.shape == (1, 4, seq_len, DIM)
         assert out_v.shape == (1, 4, seq_len, DIM)
 
-    def test_output_dtype_matches_input(self) -> None:
+    def test_output_dtype_matches_input(self, device: torch.device) -> None:
         """Decompressed output should match the input dtype."""
         from transformers import DynamicCache
 
         cache = DynamicCache()
         _ = CompressedDynamicCache(cache, head_dim=DIM, bits=BITS)
 
-        keys = torch.randn(1, 4, 1, DIM, dtype=torch.bfloat16)
-        values = torch.randn(1, 4, 1, DIM, dtype=torch.bfloat16)
+        keys = torch.randn(1, 4, 1, DIM, dtype=torch.bfloat16).to(device)
+        values = torch.randn(1, 4, 1, DIM, dtype=torch.bfloat16).to(device)
 
         out_k, out_v = cache.update(keys, values, layer_idx=0)
         assert out_k.dtype == torch.bfloat16
@@ -193,7 +193,7 @@ class TestCompressedDynamicCache:
         assert cc._compressed_keys[0].norms.dtype == torch.float32
         assert cc._compressed_values[0].norms.dtype == torch.float32
 
-    def test_vram_savings(self) -> None:
+    def test_vram_savings(self, device: torch.device) -> None:
         """Compressed storage should be smaller than FP16 baseline."""
         from transformers import DynamicCache
 
@@ -203,8 +203,8 @@ class TestCompressedDynamicCache:
         # Simulate 100 tokens across 4 layers
         for layer in range(4):
             cache.update(
-                torch.randn(1, 8, 100, DIM),
-                torch.randn(1, 8, 100, DIM),
+                torch.randn(1, 8, 100, DIM).to(device),
+                torch.randn(1, 8, 100, DIM).to(device),
                 layer_idx=layer,
             )
 
@@ -297,7 +297,7 @@ class TestCompressedDynamicCache:
         assert cache.update == original_update
         assert cache.get_seq_length == original_get_seq
 
-    def test_accuracy_parity_with_accuracy_only(self) -> None:
+    def test_accuracy_parity_with_accuracy_only(self, device: torch.device) -> None:
         """Compressed cache should produce same values as accuracy-only cache.
 
         Both compress with TurboQuantCompressorMSE at the same bit-width,
@@ -305,8 +305,8 @@ class TestCompressedDynamicCache:
         """
         from transformers import DynamicCache
 
-        keys = torch.randn(1, 4, 10, DIM)
-        values = torch.randn(1, 4, 10, DIM)
+        keys = torch.randn(1, 4, 10, DIM).to(device)
+        values = torch.randn(1, 4, 10, DIM).to(device)
 
         # Accuracy-only mode
         cache_a = DynamicCache()
@@ -366,15 +366,15 @@ BITS_4 = 4
 class TestNibblePacking:
     """Validate TQ4 nibble-packed storage in CompressedDynamicCache."""
 
-    def test_basic_update_4bit(self) -> None:
+    def test_basic_update_4bit(self, device: torch.device) -> None:
         """4-bit compressed cache should accept and return correct shapes."""
         from transformers import DynamicCache
 
         cache = DynamicCache()
         _ = CompressedDynamicCache(cache, head_dim=DIM, bits=BITS_4)
 
-        keys = torch.randn(1, 8, 1, DIM)
-        values = torch.randn(1, 8, 1, DIM)
+        keys = torch.randn(1, 8, 1, DIM).to(device)
+        values = torch.randn(1, 8, 1, DIM).to(device)
 
         out_k, out_v = cache.update(keys, values, layer_idx=0)
         assert out_k.shape == (1, 8, 1, DIM)
@@ -396,9 +396,9 @@ class TestNibblePacking:
         assert cc._compressed_keys[0].indices.dtype == torch.uint8
         assert cc._compressed_keys[0].packed is True
 
-    def test_nibble_pack_unpack_roundtrip(self) -> None:
+    def test_nibble_pack_unpack_roundtrip(self, device: torch.device) -> None:
         """Pack then unpack should recover exact original indices."""
-        indices = torch.randint(0, 16, (2, 4, 8, DIM), dtype=torch.uint8)
+        indices = torch.randint(0, 16, (2, 4, 8, DIM), dtype=torch.uint8).to(device)
 
         packed = CompressedDynamicCache._nibble_pack(indices)
         assert packed.shape == (2, 4, 8, DIM // 2)
@@ -407,7 +407,7 @@ class TestNibblePacking:
         assert unpacked.shape == (2, 4, 8, DIM)
         torch.testing.assert_close(unpacked, indices.long())
 
-    def test_compression_ratio_4bit(self) -> None:
+    def test_compression_ratio_4bit(self, device: torch.device) -> None:
         """4-bit nibble-packed should achieve ~3.7x compression."""
         from transformers import DynamicCache
 
@@ -416,8 +416,8 @@ class TestNibblePacking:
 
         for layer in range(4):
             cache.update(
-                torch.randn(1, 8, 100, DIM),
-                torch.randn(1, 8, 100, DIM),
+                torch.randn(1, 8, 100, DIM).to(device),
+                torch.randn(1, 8, 100, DIM).to(device),
                 layer_idx=layer,
             )
 
@@ -425,17 +425,17 @@ class TestNibblePacking:
         # 68 bytes per block vs 256 → ~3.76x
         assert ratio > 3.5, f"Expected >3.5x compression, got {ratio:.2f}x"
 
-    def test_4bit_better_quality_than_3bit(self) -> None:
+    def test_4bit_better_quality_than_3bit(self, device: torch.device) -> None:
         """TQ4 should have higher cosine similarity than TQ3."""
         from transformers import DynamicCache
 
-        original = torch.randn(1, 4, 50, DIM)
+        original = torch.randn(1, 4, 50, DIM).to(device)
 
         # TQ3
         cache3 = DynamicCache()
         _ = CompressedDynamicCache(cache3, head_dim=DIM, bits=BITS)
         out3, _ = cache3.update(
-            original.clone(), torch.randn(1, 4, 50, DIM), layer_idx=0
+            original.clone(), torch.randn(1, 4, 50, DIM).to(device), layer_idx=0
         )
         cos3 = torch.nn.functional.cosine_similarity(
             original.flatten(), out3.flatten(), dim=0
@@ -445,7 +445,7 @@ class TestNibblePacking:
         cache4 = DynamicCache()
         _ = CompressedDynamicCache(cache4, head_dim=DIM, bits=BITS_4)
         out4, _ = cache4.update(
-            original.clone(), torch.randn(1, 4, 50, DIM), layer_idx=0
+            original.clone(), torch.randn(1, 4, 50, DIM).to(device), layer_idx=0
         )
         cos4 = torch.nn.functional.cosine_similarity(
             original.flatten(), out4.flatten(), dim=0

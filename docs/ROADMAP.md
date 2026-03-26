@@ -168,7 +168,7 @@ Validated inside ROCm container on Radeon 890M (gfx1150): **84/84 tests passed**
 | Step | Action | GPU? | Status |
 |------|--------|------|--------|
 | 2.1 | `torch.compile(mode="default")` spike on ROCm | Yes | ✅ Both `default` and `reduce-overhead` pass, 1.17x speedup, perfect eager parity |
-| 2.2 | KV cache test parametrization — add `device` fixture to `test_kv_cache.py` (basic update, nibble packing, VRAM savings) | Yes | Not started |
+| 2.2 | KV cache test parametrization — add `device` fixture to `test_kv_cache.py` (basic update, nibble packing, VRAM savings) | Yes | ✅ 11 tests parametrized, 95/95 pass on AMD GPU |
 
 **Session 2 — Coverage & hardening:**
 
