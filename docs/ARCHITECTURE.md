@@ -464,9 +464,9 @@ quadrantChart
     quadrant-3 Avoid
     quadrant-4 Memory focus
     FP16 Baseline: [0.05, 0.95]
-    TurboQuantKVCache (accuracy-only): [0.10, 0.78]
-    CompressedDynamicCache TQ3: [0.55, 0.75]
-    CompressedDynamicCache TQ4 nibble: [0.78, 0.82]
+    TurboQuantKVCache accuracy-only: [0.10, 0.78]
+    CompressedDynCache TQ3: [0.55, 0.75]
+    CompressedDynCache TQ4 nibble: [0.78, 0.82]
 ```
 
 ---
