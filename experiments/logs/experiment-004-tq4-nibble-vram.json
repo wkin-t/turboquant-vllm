@@ -1,0 +1,41 @@
+{
+  "model_id": "allenai/Molmo2-4B",
+  "bits": 4,
+  "mode": "compressed",
+  "head_dim": 128,
+  "num_heads": 32,
+  "num_kv_heads": 8,
+  "num_layers": 36,
+  "prompt": "Describe what happens in this video scene in detail. Include characters, actions, dialogue, and setting.",
+  "video_path": "/var/home/Alberto-Codes/Projects/molmo-video-analyzer/data/tv/clip01.mp4",
+  "baseline": {
+    "output_text": "The scene opens in a cozy, lived-in apartment with gray walls and a white door, where a woman with long, curly brown hair in a red jacket over a black shirt stands beside a man in a green jacket with a brown collar over a purple shirt. They're huddled close, both looking worried and tense. The woman grips a black cell phone with a long antenna in her right hand, her left hand resting on the man's arm. Behind them, a black bookshelf is filled with books and a box of Checkers game pieces, and a green bicycle is propped against the wall. A window with white blinds lets in soft light, and a framed picture hangs on the wall.\n\nThe man answers the call and begins speaking, gesturing with his hands as he talks. The woman listens intently, her expression shifting between concern and confusion. The conversation continues as the man keeps his hands raised, explaining something. Then a third person enters: a man with short, curly brown hair wearing a brown jacket over a white button-down shirt with a subtle pattern. He steps into the room and immediately joins the conversation, his tone and body language suggesting he's trying to clarify something important. The woman looks up at him, her mouth slightly open as if she's about",
+    "vram_peak_mib": 18058.43994140625,
+    "elapsed_s": 8.525887546005833
+  },
+  "turboquant": {
+    "output_text": "The scene opens in a cozy, lived-in apartment with gray walls and a white door, where a woman with long, curly brown hair in a red jacket over a black shirt stands beside a man in a green jacket with a brown collar over a purple shirt. They're huddled close, both looking off to the side with tense, worried expressions. The woman grips a black, old-fashioned cell phone with a long antenna, and the man holds it as well, his face tight with concern. Behind them, a black bookshelf is filled with books and games, including a red box labeled \"Checkers\" and a black box labeled \"500.\" A bicycle is propped against the wall, and a window with white blinds lets in soft light. A framed picture hangs on the wall, and a red lampshade glows above the bookshelf.\n\nThe woman speaks into the phone, her voice urgent, while the man listens intently. She then takes the phone from him and continues talking, her expression shifting between worry and determination. The man gestures with his hands as he responds, his tone animated and concerned. The woman looks down at the phone, then back up at him, her concern deepening. The man's hands move expressively as he tries to explain",
+    "vram_peak_mib": 18056.50244140625,
+    "elapsed_s": 28.654447427004925,
+    "compression_stats": {
+      "num_layers": 36,
+      "seq_len": 11652,
+      "batch_size": 1,
+      "num_heads": 8,
+      "head_dim": 128,
+      "bits": 4,
+      "nibble_packed": true,
+      "compressed_mib": 435.2431640625,
+      "baseline_mib": 1638.5625,
+      "compression_ratio": 3.76,
+      "savings_mib": 1203.3193359375
+    }
+  },
+  "comparison": {
+    "texts_identical": false,
+    "time_ratio": 3.361,
+    "vram_delta_mib": 1.9,
+    "baseline_text_preview": "The scene opens in a cozy, lived-in apartment with gray walls and a white door, where a woman with long, curly brown hair in a red jacket over a black shirt stands beside a man in a green jacket with ",
+    "turboquant_text_preview": "The scene opens in a cozy, lived-in apartment with gray walls and a white door, where a woman with long, curly brown hair in a red jacket over a black shirt stands beside a man in a green jacket with "
+  }
+}
