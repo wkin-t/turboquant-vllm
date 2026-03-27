@@ -682,6 +682,8 @@ Override buffer allocation to use TQ4 page size (68 bytes/token/head vs 256 FP16
 - Full round-trip: Triton compress→decompress == PyTorch compress→decompress
 - 176 total tests pass
 
+**Phase 3c COMPLETE (2026-03-27).** All 10 steps done. Decode step 3.7x faster end-to-end at 4096 cache (0.596ms → 0.162ms). Next: Phase 3d production benchmark.
+
 **Smoke test result (2026-03-27):** vLLM 0.18.0 + Molmo2-8B + `--attention-backend CUSTOM` with packed TQ4 uint8 cache:
 - Model loads, serves on port 8100 ✅
 - "What is 2+2?" → "4" ✅
