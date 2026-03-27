@@ -712,10 +712,18 @@ Override buffer allocation to use TQ4 page size (68 bytes/token/head vs 256 FP16
 
 | Step | Action | Status |
 |------|--------|--------|
-| 3d.1 | Re-run experiment 014 with vLLM + TQ4 backend | |
-| 3d.2 | Compare: vLLM-TQ4 vs vLLM-baseline vs HF-TQ4 | |
-| 3d.3 | Measure throughput (tok/s), VRAM, quality | |
+| 3d.1 | Re-run experiment 014 with vLLM + TQ4 backend | ✅ |
+| 3d.2 | Compare: vLLM-TQ4 vs vLLM-baseline | ✅ |
+| 3d.3 | Measure throughput (tok/s), VRAM, quality | ✅ |
 | 3d.4 | Update `vllm-nvidia.service` quadlet to use TQ4 backend | |
+
+**Phase 3d result (2026-03-27):** Production benchmark, Molmo2-8B, Seinfeld Soup Nazi, 120s:
+- Standard vLLM (5s clips, 24 clips): 187.1s total, 28.6 tok/s
+- **vLLM + TQ4 (19s clips, 7 clips): 55.9s total, 29.7 tok/s — 3.35x faster**
+- Per-clip throughput identical (~8s, ~29 tok/s) — speedup from 3.4x fewer API calls
+- TQ4 compressed cache enables 19s context window (vs 5s baseline)
+- Character recognition preserved: jerry, george, elaine identified in TQ4 output
+- TQ4 backend auto-registers via `vllm.general_plugins` entry point
 
 **Resolved risks:**
 - ~~`CacheDType` Literal type~~ — bypassed entirely. Use `"auto"` dtype. No vLLM source patch needed.
