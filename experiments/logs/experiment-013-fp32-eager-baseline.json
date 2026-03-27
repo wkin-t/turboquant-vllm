@@ -1,0 +1,53 @@
+{
+  "experiment": "013-fp32-eager-baseline",
+  "date": "2026-03-26 22:08:59",
+  "model_id": "allenai/Molmo2-4B",
+  "max_new_tokens": 64,
+  "text": {
+    "bf16_sdpa": {
+      "label": "text-bf16-SDPA",
+      "input_tokens": 17,
+      "output_tokens": 64,
+      "output_text": "Jerry Seinfeld is the main character of the sitcom *Seinfeld*, portrayed by Jason Alexander. Jerry is a witty, neurotic, and often self-absorbed New York City man in his late 20s or early 30s. He works as a freelance writer and is known for his dry humor",
+      "vram_peak_mib": 10014.7,
+      "elapsed_s": 1.47,
+      "tok_per_s": 43.54
+    },
+    "bf16_eager": {
+      "label": "text-bf16-eager",
+      "input_tokens": 17,
+      "output_tokens": 64,
+      "output_text": "Jerry Seinfeld is the main character of the sitcom *Seinfeld*, portrayed by Jason Alexander. Jerry is a witty, neurotic, and often self-absorbed New York City man in his late 20s or early 30s. He works as a freelance writer and is known for his dry humor",
+      "vram_peak_mib": 10014.7,
+      "elapsed_s": 1.16,
+      "tok_per_s": 55.29
+    },
+    "fp32_eager": {
+      "label": "text-fp32-eager",
+      "input_tokens": 17,
+      "output_tokens": 64,
+      "output_text": "Jerry Seinfeld is the main character of the sitcom *Seinfeld*, portrayed by Jason Alexander. Jerry is a witty, neurotic, and often self-absorbed New York City man in his late 20s or early 30s. He works as a freelance writer and is known for his dry humor",
+      "vram_peak_mib": 20020.5,
+      "elapsed_s": 1.66,
+      "tok_per_s": 38.57
+    },
+    "fused_tq4": {
+      "label": "text-fusedTQ4",
+      "input_tokens": 17,
+      "output_tokens": 64,
+      "output_text": "Jerry Seinfeld is the main character of the TV show *Seinfeld*, portrayed by Jerry Seinfeld himself. Jerry is a 30-something-year-old New York City man who works as a freelance writer and lives in a small apartment in the Upper West Side. Known for his dry wit, sarcasm, and",
+      "vram_peak_mib": 10012.6,
+      "elapsed_s": 7.45,
+      "tok_per_s": 8.6
+    },
+    "analysis": {
+      "fused_vs_fp32_eager": 0.22,
+      "fused_vs_bf16_eager": 0.16,
+      "fused_vs_bf16_sdpa": 0.2,
+      "sdpa_vs_fp32_eager": 1.13
+    }
+  },
+  "image": {
+    "status": "skipped"
+  }
+}
