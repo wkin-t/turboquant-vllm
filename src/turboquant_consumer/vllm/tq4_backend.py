@@ -36,6 +36,7 @@ from vllm.v1.attention.backends.registry import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from turboquant_consumer.quantizer import TurboQuantMSE
+from turboquant_consumer.triton.tq4_decompress import tq4_decompress
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionImplBase, AttentionMetadataBuilder
@@ -319,12 +320,23 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         self,
         kv_cache: torch.Tensor,
         compute_dtype: torch.dtype,
+        *,
+        apply_rotation: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decompress packed uint8 cache -> FP16 key_cache, value_cache.
+        """Decompress packed uint8 cache -> key_cache, value_cache.
+
+        Uses the fused Triton kernel (Phase 3c.8) for decompress.  When
+        ``apply_rotation=False``, output stays in rotated space and the
+        caller must pre-rotate Q by ``Pi^T`` and post-rotate the output
+        by ``Pi``.  Default ``True`` applies unrotation for backward
+        compatibility with tests.
 
         Args:
             kv_cache: ``(NB, BS, total_bytes)`` uint8 packed cache.
             compute_dtype: Output dtype (e.g., ``torch.bfloat16``).
+            apply_rotation: If ``True`` (default), apply unrotation to
+                return tensors in original space.  ``False`` returns
+                rotated-space tensors for the optimized forward path.
 
         Returns:
             key_cache: ``(NB, BS, H, D)`` in ``compute_dtype``.
@@ -335,9 +347,10 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         half_D = self._half_D
         D = self.head_size
 
+        self._ensure_device(kv_cache.device)
         flat = kv_cache.reshape(NB * BS, self._total_bytes)
 
-        # Extract and decompress K
+        # Extract K regions
         k_packed = flat[:, : self._k_idx_end].contiguous().reshape(-1, H, half_D)
         k_norms = (
             flat[:, self._k_idx_end : self._k_norm_end]
@@ -345,9 +358,8 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             .view(torch.float32)
             .reshape(-1, H, 1)
         )
-        key_fp16 = self._decompress(k_packed, k_norms, compute_dtype)
 
-        # Extract and decompress V
+        # Extract V regions
         v_packed = (
             flat[:, self._k_norm_end : self._v_idx_end]
             .contiguous()
@@ -359,13 +371,22 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             .view(torch.float32)
             .reshape(-1, H, 1)
         )
-        value_fp16 = self._decompress(v_packed, v_norms, compute_dtype)
 
-        # Reshape to (NB, BS, H, D) for Flash Attention
-        key_cache = key_fp16.reshape(NB, BS, H, D)
-        value_cache = value_fp16.reshape(NB, BS, H, D)
+        # Fused Triton decompress (no rotation applied)
+        key_out = tq4_decompress(k_packed, k_norms, self._tq4_centroids, compute_dtype)
+        value_out = tq4_decompress(
+            v_packed,
+            v_norms,
+            self._tq4_centroids,
+            compute_dtype,
+        )
 
-        return key_cache, value_cache
+        # Optionally unrotate (backward compat for tests; forward() skips this)
+        if apply_rotation:
+            key_out = (key_out.float() @ self._tq4_rotation).to(compute_dtype)
+            value_out = (value_out.float() @ self._tq4_rotation).to(compute_dtype)
+
+        return key_out.reshape(NB, BS, H, D), value_out.reshape(NB, BS, H, D)
 
     # ----- forward -----
 
@@ -381,10 +402,11 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         output_scale=None,
         output_block_scale=None,
     ):
-        """TQ4 attention: compress -> store packed -> decompress -> FA.
+        """TQ4 attention: compress -> store -> pre-rotate Q -> decompress -> FA -> post-rotate.
 
-        Phase 3c: The uint8 KV cache stores packed TQ4 bytes. Each forward
-        call decompresses to FP16 and calls Flash Attention directly.
+        Phase 3c.8: Uses fused Triton decompress (no rotation). The
+        rotation is applied to Q before attention and to the output
+        after, saving O(cache_len) matmuls per decode step.
         """
         assert output is not None
 
@@ -419,11 +441,19 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             self._ensure_device(query.device)
             self._compress_and_store(key, value, kv_cache, attn_metadata.slot_mapping)
 
-        # Step 2: Decompress full cache for attention
+        # Step 2: Pre-rotate Q by Pi^T (O(num_actual_tokens), not O(cache_len))
         self._ensure_device(query.device)
-        key_cache, value_cache = self._decompress_cache(kv_cache, query.dtype)
+        q_slice = query[:num_actual_tokens]
+        q_rot = (q_slice.float() @ self._tq4_rotation.T).to(q_slice.dtype)
 
-        # Step 3: Run Flash Attention directly
+        # Step 3: Decompress full cache (Triton fused, skip rotation)
+        key_cache, value_cache = self._decompress_cache(
+            kv_cache,
+            query.dtype,
+            apply_rotation=False,
+        )
+
+        # Step 4: Run Flash Attention with rotated Q and rotated KV
         from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
         if attn_metadata.use_cascade:
@@ -438,7 +468,7 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         v_descale = layer._v_scale.expand(descale_shape)
 
         flash_attn_varlen_func(
-            q=query[:num_actual_tokens],
+            q=q_rot,
             k=key_cache,
             v=value_cache,
             out=output[:num_actual_tokens],
@@ -461,6 +491,12 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             v_descale=v_descale,
             num_splits=attn_metadata.max_num_splits,
             s_aux=self.sinks,
+        )
+
+        # Step 5: Post-rotate output by Pi (undo rotation space)
+        out_slice = output[:num_actual_tokens]
+        output[:num_actual_tokens] = (out_slice.float() @ self._tq4_rotation).to(
+            out_slice.dtype
         )
 
         return output

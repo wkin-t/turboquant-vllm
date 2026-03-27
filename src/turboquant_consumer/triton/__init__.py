@@ -3,6 +3,7 @@
 Phase 1 (P5): Vanilla Flash Attention kernel with GQA support.
 Phase 2 (P5): Fused TQ4 K decompression inside the FA inner loop.
 Phase 3 (P5): Fused TQ4 K+V decompression with post-rotation.
+Phase 3c.8: Standalone TQ4 cache decompress kernel for vLLM backend.
 
 Legacy: Q@K^T-only fused kernel (superseded -- see Key Lesson #7).
 
@@ -52,9 +53,8 @@ from turboquant_consumer.triton.flash_attention_tq4 import triton_flash_attentio
 from turboquant_consumer.triton.flash_attention_tq4_kv import (
     triton_flash_attention_tq4_kv,
 )
-
-# Legacy (Q@K^T-only kernel, superseded by full FA fusion)
 from turboquant_consumer.triton.fused_qk_attention import fused_qk_scores
+from turboquant_consumer.triton.tq4_decompress import tq4_decompress
 
 __all__ = [
     "triton_flash_attention",
@@ -66,5 +66,6 @@ __all__ = [
     "install_triton_fa",
     "install_fused_tq4_kv",
     "uninstall_fused_tq4_kv",
+    "tq4_decompress",
     "fused_qk_scores",
 ]
