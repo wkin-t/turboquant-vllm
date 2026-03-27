@@ -585,12 +585,14 @@ vLLM v0.18.0 has a first-class plugin system for custom attention backends:
 
 | Step | Action | Status |
 |------|--------|--------|
-| 3a.1 | Create `src/turboquant_consumer/vllm/tq4_backend.py` | |
-| 3a.2 | Implement `TQ4AttentionBackend` (subclass `AttentionBackend`) | |
-| 3a.3 | Implement `get_kv_cache_shape()` for TQ4 page layout | |
-| 3a.4 | Stub `TQ4AttentionImpl.forward()` — passthrough to Flash Attention (no compression) | |
-| 3a.5 | Register with `AttentionBackendEnum.CUSTOM` | |
+| 3a.1 | Create `src/turboquant_consumer/vllm/tq4_backend.py` | ✅ |
+| 3a.2 | Implement `TQ4AttentionBackend` (subclass `FlashAttentionBackend`) | ✅ |
+| 3a.3 | Implement `get_kv_cache_shape()` — inherits Flash Attention shape (Phase 3b overrides) | ✅ |
+| 3a.4 | Stub `TQ4AttentionImpl` — passthrough to `FlashAttentionImpl` (no compression) | ✅ |
+| 3a.5 | Register via `vllm.general_plugins` entry point + `register_tq4_backend()` | ✅ |
 | 3a.6 | Smoke test: `vllm serve` starts and serves with TQ4 backend selected | |
+
+12 tests pass (registration, interface compliance, byte math). All pre-commit hooks green.
 
 ##### Phase 3b: Compression write path
 
