@@ -394,29 +394,138 @@ Approach B selected: **AttentionInterface + side-channel cache reference.** Eval
 - arXiv 2511.11581 — "Anatomy of Attention" (GQA Q-Block, Triton performance parity with FA-3)
 - arXiv 2405.02803 — "Is Flash Attention Stable?" (FA achieves 1.7x lower RMSE than SDPA)
 
-### P5b: Fused-aware cache mode (optimization, after P5 validated)
+### P5b: Fused-aware cache mode (COMPLETE 2026-03-26)
 
-**Goal:** Eliminate wasted decompression in the fused kernel path. Currently, `CompressedDynamicCache.update()` decompresses K/V on every call (for SDPA compatibility), but the fused attention function ignores the decompressed tensors and reads compressed data directly. This wastes compute proportional to cache size × layers × decode steps.
+**Goal:** Eliminate wasted decompression in the fused kernel path.
 
-**Approach:** Add a `fused_mode=True` flag to `CompressedDynamicCache` that skips the decompression step in `update()`, returning lightweight placeholders (or empty tensors) instead of full fp16 K/V. The fused attention function already reads from `_compressed_keys`/`_compressed_values`, so it doesn't need the decompressed output.
+**Result:** Added `fused_mode=True` flag to CompressedDynamicCache. `install_fused_tq4_kv()` enables it automatically. Throughput impact: +6% on text (17 tokens), +13% on image (1205 tokens).
 
-**Why deferred:** Correctness first. The current approach (decompress + ignore) is wasteful but correct and simple. The fused-aware optimization removes a safety net — if the attention function falls back to SDPA for any reason, it would get garbage K/V. Only enable after the fused path is thoroughly validated end-to-end.
+---
 
-**Expected impact:** Eliminates ~50% of the per-layer overhead during decode (the dequantize + cat operations in `_compressed_update`). This is the "1.78x overhead" from incremental dequant — the fused kernel should reduce total overhead to near 1.0x.
+## North Star: Match the Paper
 
-### P6: TQ3 bit-packing (research, nice-to-have)
+The Google TurboQuant paper claims **5-6x compression AND up to 8x attention speedup.** Our current implementation achieves compression (3.76x) but not speedup. The gap: our fused kernel dequantizes K fully inside the inner loop (centroid gather → 128 floats → dot product). **The paper never reconstructs the full key vector.** It uses `estimate_inner_product` — an unbiased estimator that computes Q@K^T directly from compressed indices + QJL sign corrections.
 
-**Goal:** Pack 3-bit indices at the theoretical optimum (48 bytes per 128 indices, 4.92x compression).
+**What we have vs what the paper does:**
 
-**Why deferred:** 3-bit indices cross byte boundaries, making parallel pack/unpack non-trivial. No PyTorch/Triton implementation exists — only C/CUDA (ik_llama.cpp). The 30% improvement over TQ4 nibble (4.92x vs 3.76x) doesn't justify the complexity until the easier wins are shipped.
+| Component | Our status | Paper's approach | Speed impact |
+|-----------|-----------|------------------|-------------|
+| PolarQuant (rotation + Lloyd-Max) | Done (TurboQuantMSE) | Same | — |
+| QJL correction (Stage 2) | Built but unused (TurboQuantProd) | Core of speed claim | Eliminates dequant step |
+| `estimate_inner_product()` | Built (CompressorV2) | Fused into attention kernel | **8x fewer bytes read** |
+| Full-dequant fused FA (P5) | Done — proves FA fusion works | Not used by paper | 0.62x of unfused (too slow) |
+| Direct inner-product fused FA | **NOT BUILT** | Paper's actual kernel | **The speed target** |
 
-### P7: vLLM native integration
+**Key Lesson #2 was wrong in context:** "QJL is invisible in drop-in mode" is true for drop-in cache replacement. But QJL is **essential** for the paper's speed claim because it enables `estimate_inner_product` which avoids full dequantization. The fused kernel should use TurboQuantProd, not TurboQuantMSE.
 
-**Goal:** Run TurboQuant as a vLLM KV cache backend, enabling compressed caching in production serving.
+### P9: Paper-faithful fused kernel — `estimate_inner_product` in Flash Attention
 
-**Status:** vLLM currently supports FP8 KV cache only. No integer sub-byte support. The KV Offloading Connector API (Jan 2026) handles offloading tiers, not quantization. Integrating TurboQuant would require attention backend changes, not just connector API.
+**Goal:** Fuse TurboQuantProd's unbiased inner product estimator into Flash Attention. Achieve both compression AND speedup matching the paper's claims on RTX 4090.
 
-**Our path:** Monitor upstream. When vLLM ships TurboQuant support (expected Q2-Q3 2026), we adopt on day one with confidence from our validation work. Our codebase could also serve as a reference implementation for a vLLM contribution.
+**Why this is different from P5:** P5 dequantizes K inside the FA loop (centroid gather → full 128-float vector → dot product). P9 computes Q@K^T directly from compressed data without ever materializing the full key:
+
+```
+P5 (current, slow):
+  For each K tile:
+    packed → nibble unpack → centroid gather → [BLOCK_N, 128] fp16 → Q @ K^T
+
+P9 (paper-faithful, fast):
+  For each K tile:
+    MSE term:  sum(q_rot[d] * centroids[idx[d]]) * norm    (~128 ops, scalar output)
+    QJL term:  res_norm * sqrt(pi/2)/m * sum(q_proj * signs) (~128 ops, scalar output)
+    score = MSE_term + QJL_term                              (never materializes 128 floats)
+```
+
+**Storage per key position (TurboQuantProd at 4-bit total):**
+- MSE indices: 128 × 3-bit = 48 bytes (with bit-packing) or 128 bytes (uint8 unpacked)
+- QJL signs: 128 bits = 16 bytes (packed as uint8)
+- Norms: 4 bytes (fp32)
+- Residual norms: 4 bytes (fp32)
+- **Total: 72 bytes (with 3-bit packing) or 152 bytes (uint8 unpacked)**
+
+**Storage per value position:** Values still use TurboQuantMSE (full 4-bit, 68 bytes nibble-packed). QJL not needed for V because V appears in P@V matmul, not inner product estimation.
+
+#### Phase 1: Validate TurboQuantProd quality on Molmo2 (1 day)
+
+| Step | Action | Validation |
+|------|--------|------------|
+| 1.1 | Run Molmo2-4B with TurboQuantProd(bits=4) KV cache | Coherent output, character names (4B text-only) |
+| 1.2 | Compare quality: TurboQuantProd(4-bit=3MSE+1QJL) vs TurboQuantMSE(4-bit) | Cosine similarity, token match |
+| 1.3 | Verify `estimate_inner_product` matches standard Q@K^T on decompressed keys | Per-layer cosine >0.998 |
+
+**Risk:** TurboQuantProd uses 3-bit MSE (8 centroids) instead of 4-bit (16 centroids). The QJL correction should compensate for inner product estimation, but reconstruction quality may be lower. Experiment 001 showed garbled output with TurboQuantProd in drop-in mode — but P9 uses `estimate_inner_product`, not drop-in dequant.
+
+#### Phase 2: Fused inner-product kernel (2-3 days)
+
+| Step | Action | Validation |
+|------|--------|------------|
+| 2.1 | New Triton kernel: MSE dot product directly from indices (no dequant) | Cosine >0.998 vs unfused |
+| 2.2 | Add QJL correction term inside kernel | Combined score matches `estimate_inner_product` |
+| 2.3 | Integrate with FA online softmax (same `(m_i, l_i, acc)` state machine) | 36-layer composition >0.93 |
+| 2.4 | V tiles use MSE-only dequant (same as P5 Phase 3) or separate path | Output matches reference |
+
+**Key kernel design:**
+```
+# Pre-compute outside kernel:
+q_rot = q @ Pi_mse^T              # Pre-rotate for MSE term (already proven in P5)
+q_proj = q @ S^T                  # Pre-project for QJL term (new)
+
+# Inside FA inner loop, for each K tile:
+# MSE term: dot product from compressed indices (no full dequant)
+mse_score = norm * sum_d(q_rot[d] * centroids_3bit[idx[d]])
+
+# QJL term: correction from sign bits
+qjl_score = res_norm * sqrt(pi/2) / m * sum_j(q_proj[j] * signs[j])
+
+# Combined attention score
+score = mse_score + qjl_score
+
+# Feed into online softmax as before (proven stable in P5)
+```
+
+#### Phase 3: 3-bit packing for indices (1-2 days)
+
+| Step | Action | Validation |
+|------|--------|------------|
+| 3.1 | Implement 3-bit byte-crossing pack/unpack in Triton | Round-trip correctness |
+| 3.2 | Integrate into kernel (replace uint8 index load) | Same output, smaller reads |
+| 3.3 | Pack QJL signs as bit-packed uint8 (128 bits = 16 bytes) | Already efficient |
+
+This reduces key storage from 152 bytes (uint8) to 72 bytes (bit-packed) per position. Combined with V at 68 bytes, total KV = 140 bytes vs 512 FP16 = **3.66x compression with speed.**
+
+#### Phase 4: Profile and optimize (1-2 days)
+
+| Step | Action | Validation |
+|------|--------|------------|
+| 4.1 | Nsight Compute profiling of P9 kernel vs cuDNN FA | Identify bottleneck |
+| 4.2 | Tune autotune configs for RTX 4090 (SM89) | Peak achieved bandwidth |
+| 4.3 | Benchmark at 1K, 5K, 11K token sequences | Find crossover point |
+| 4.4 | Compare vs paper's claimed 8x (adjusting for H100→4090 bandwidth ratio) | Realistic target for consumer GPU |
+
+**RTX 4090 vs H100 bandwidth:** 1008 GB/s vs 3350 GB/s (3.3x gap). The paper's 8x on H100 might translate to ~2.5-4x on RTX 4090 — still a significant win if the kernel is bandwidth-bound.
+
+#### Phase 5: E2E Molmo2 validation + vLLM integration
+
+| Step | Action | Validation |
+|------|--------|------------|
+| 5.1 | E2E experiment: SDPA vs unfused TQ4 vs P9 fused on Molmo2-4B | All three produce coherent output |
+| 5.2 | Throughput comparison at video-scale (11K+ tokens) | Fused >= unfused AND >= 1.5x vs SDPA at long sequences |
+| 5.3 | vLLM custom attention backend (PagedAttention + TurboQuantProd) | Serve Molmo2-8B with TQ KV cache |
+| 5.4 | Production benchmark: max_model_len with TQ vs FP8 | 3x+ context window at equal or better throughput |
+
+**Success criteria (north star):**
+- KV compression: >=3.5x vs FP16 (matching paper)
+- Attention speedup: >= 1.5x vs baseline at 11K+ tokens on RTX 4090
+- Text quality: coherent output, character names preserved on Molmo2-8B
+- max_model_len: 3x increase in vLLM serving
+
+### P6: TQ3 bit-packing (folded into P9 Phase 3)
+
+Now part of P9 Phase 3. Required for the paper-faithful storage format.
+
+### P7: vLLM native integration (folded into P9 Phase 5)
+
+Now part of P9 Phase 5. No longer "monitor upstream" — we build it.
 
 ---
 
@@ -464,3 +573,7 @@ Approach B selected: **AttentionInterface + side-channel cache reference.** Eval
 7. **Q@K^T-only fusion is a dead end for multi-layer models.** Materializing attention scores in fp16 between Q@K^T and softmax introduces 0.023 cosine loss per layer, compounding to 0.43 over 36 layers. Full Flash Attention fusion (fp32 accumulation throughout, single fp16 cast at output) is the only correct approach. The 17.8x micro-benchmark speedup was misleading — always validate multi-layer composition early.
 
 8. **No existing system fuses codebook VQ with Flash Attention.** Survey of 13 quantized attention implementations (KIVI, BitDecoding, Kitty, QServe, FlashInfer, etc.) found they all use scalar quantization (INT2/4/8, FP4/8). TurboQuant's vector quantization codebook lookup is architecturally different and requires a novel kernel design.
+
+9. **Dequant-then-dot is the wrong architecture for speed.** P5 proved full FA fusion prevents precision collapse across 36 layers. But dequanting K inside the inner loop (centroid gather → 128 floats → Q@K^T) is slower than cuDNN's optimized FA reading fp16 directly. The paper achieves speedup by computing Q@K^T directly from compressed indices via `estimate_inner_product` — never materializing the full key vector. This requires TurboQuantProd (MSE+QJL), not TurboQuantMSE.
+
+10. **Key Lesson #2 was context-dependent.** "QJL is invisible in drop-in mode" is true for drop-in cache replacement (standard attention on decompressed keys). But QJL is essential for the paper's speed claim — it enables `estimate_inner_product` which avoids full dequantization. The fused kernel for speed must use TurboQuantProd, not TurboQuantMSE.
