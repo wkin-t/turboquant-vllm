@@ -402,130 +402,87 @@ Approach B selected: **AttentionInterface + side-channel cache reference.** Eval
 
 ---
 
-## North Star: Match the Paper
+## North Star: Match the Paper — Compression AND Speed
 
-The Google TurboQuant paper claims **5-6x compression AND up to 8x attention speedup.** Our current implementation achieves compression (3.76x) but not speedup. The gap: our fused kernel dequantizes K fully inside the inner loop (centroid gather → 128 floats → dot product). **The paper never reconstructs the full key vector.** It uses `estimate_inner_product` — an unbiased estimator that computes Q@K^T directly from compressed indices + QJL sign corrections.
+The Google TurboQuant paper claims **5-6x compression AND up to 8x attention speedup.** We have compression (3.76x) but not speed. Both are required.
 
-**What we have vs what the paper does:**
+### P9: Closing the Speed Gap — PENDING RESEARCH
 
-| Component | Our status | Paper's approach | Speed impact |
-|-----------|-----------|------------------|-------------|
-| PolarQuant (rotation + Lloyd-Max) | Done (TurboQuantMSE) | Same | — |
-| QJL correction (Stage 2) | Built but unused (TurboQuantProd) | Core of speed claim | Eliminates dequant step |
-| `estimate_inner_product()` | Built (CompressorV2) | Fused into attention kernel | **8x fewer bytes read** |
-| Full-dequant fused FA (P5) | Done — proves FA fusion works | Not used by paper | 0.62x of unfused (too slow) |
-| Direct inner-product fused FA | **NOT BUILT** | Paper's actual kernel | **The speed target** |
+**Status: BLOCKED on research.** Experiment 012 revealed that the paper's `estimate_inner_product` approach (TurboQuantProd with QJL correction) **does not work on Molmo2-4B** at practical bit budgets:
 
-**Key Lesson #2 was wrong in context:** "QJL is invisible in drop-in mode" is true for drop-in cache replacement. But QJL is **essential** for the paper's speed claim because it enables `estimate_inner_product` which avoids full dequantization. The fused kernel should use TurboQuantProd, not TurboQuantMSE.
+| Total bits | MSE bits | Centroids | QJL | L0 cosine | 36-layer output |
+|---|---|---|---|---|---|
+| 4 (3MSE+1QJL) | 3 | 8 | 1-bit | 0.847 | Garbled (EOS after 1 token) |
+| 5 (4MSE+1QJL) | 4 | 16 | 1-bit | 0.928 | Garbled (empty tokens) |
+| 6 (5MSE+1QJL) | 5 | 32 | 1-bit | 0.971 | Garbled (EOS after 1 token) |
+| **4 MSE-only** | **4** | **16** | **none** | **>0.999** | **Coherent, 32/32 token match** |
 
-### P9: Paper-faithful fused kernel — `estimate_inner_product` in Flash Attention
+The QJL correction adds noise (~0.847-0.971 cosine vs >0.999 for MSE-only) that compounds catastrophically through 36 layers of residual connections + layer norms.
 
-**Goal:** Fuse TurboQuantProd's unbiased inner product estimator into Flash Attention. Achieve both compression AND speedup matching the paper's claims on RTX 4090.
+**The paper claims this works on Gemma and Mistral.** We don't understand why it fails on Molmo2. This is the research gap.
 
-**Why this is different from P5:** P5 dequantizes K inside the FA loop (centroid gather → full 128-float vector → dot product). P9 computes Q@K^T directly from compressed data without ever materializing the full key:
+#### Open Research Questions (must answer before proceeding)
 
-```
-P5 (current, slow):
-  For each K tile:
-    packed → nibble unpack → centroid gather → [BLOCK_N, 128] fp16 → Q @ K^T
+**Q1: What models did the paper benchmark, and how?**
+- Paper tests on Gemma and Mistral. Molmo2 is a vision-language model with different attention patterns (visual tokens dominate). Does the QJL noise interact differently with vision embeddings vs text-only?
+- Did the paper benchmark `estimate_inner_product` across 36 layers end-to-end, or only single-layer attention quality? Their 8x speedup claim is for "computing attention logits" — potentially single-layer micro-benchmark.
+- **Action:** Deep-read the paper (arXiv 2504.19874) focusing on their experimental methodology, especially multi-layer evaluation.
 
-P9 (paper-faithful, fast):
-  For each K tile:
-    MSE term:  sum(q_rot[d] * centroids[idx[d]]) * norm    (~128 ops, scalar output)
-    QJL term:  res_norm * sqrt(pi/2)/m * sum(q_proj * signs) (~128 ops, scalar output)
-    score = MSE_term + QJL_term                              (never materializes 128 floats)
-```
+**Q2: Is our QJL implementation correct?**
+- Our `estimate_inner_product` passes unit tests (unbiased, correlated with true IP). But the per-layer cosine similarity is much lower than expected.
+- The paper uses `qjl_dim = d` (same as head_dim). We do the same (128). Could larger `qjl_dim` help?
+- The QJL scaling factor `sqrt(pi/2) / m` — is our `m = qjl_dim` or something else?
+- **Action:** Compare our implementation line-by-line against Dejan.ai's turboquant-pytorch and tonbistudio's implementation.
 
-**Storage per key position (TurboQuantProd at 4-bit total):**
-- MSE indices: 128 × 3-bit = 48 bytes (with bit-packing) or 128 bytes (uint8 unpacked)
-- QJL signs: 128 bits = 16 bytes (packed as uint8)
-- Norms: 4 bytes (fp32)
-- Residual norms: 4 bytes (fp32)
-- **Total: 72 bytes (with 3-bit packing) or 152 bytes (uint8 unpacked)**
+**Q3: Does the paper's kernel actually avoid full dequantization?**
+- Our research assumed the paper's speed comes from `estimate_inner_product` (never materializing full K). But re-reading: the Dejan.ai kernel does centroid gather + dot product (same as our P5 kernel). The 8x claim is vs FP32 baseline, not vs Flash Attention.
+- **Critical distinction:** 8x speedup vs FP32 attention is a very different claim than 8x vs cuDNN Flash Attention. Our P5 kernel IS faster than FP32 attention — it's only slower than cuDNN FA.
+- **Action:** Verify what the paper's 8x baseline actually is.
 
-**Storage per value position:** Values still use TurboQuantMSE (full 4-bit, 68 bytes nibble-packed). QJL not needed for V because V appears in P@V matmul, not inner product estimation.
+**Q4: Is the P5 kernel already achieving paper-level performance?**
+- The paper claims 8x vs FP32. Our P5 kernel on RTX 4090:
+  - FP32 baseline: unknown (we compared vs bf16 SDPA / cuDNN FA)
+  - cuDNN FA (bf16): 47 tok/s → our fused: 16 tok/s (0.34x)
+  - But FP32 attention (no Flash Attention, no cuDNN) would be MUCH slower
+- If the paper's baseline is naive FP32 attention (no Flash Attention), then our P5 fused kernel may already match or exceed the paper's speed claim.
+- **Action:** Benchmark naive FP32 attention (eager mode, no SDPA) and compare vs our P5 fused kernel.
 
-#### Phase 1: Validate TurboQuantProd quality on Molmo2 (1 day)
+**Q5: Can kernel optimization close the P5→cuDNN gap?**
+- Our Triton kernel hasn't been profiled or tuned. Generic autotune configs, no register budget analysis.
+- cuDNN Flash Attention has years of optimization. How close can Triton get?
+- **Action:** Nsight Compute profiling of P5 kernel to identify the bottleneck (compute-bound? memory-bound? launch overhead?).
 
-| Step | Action | Validation |
-|------|--------|------------|
-| 1.1 | Run Molmo2-4B with TurboQuantProd(bits=4) KV cache | Coherent output, character names (4B text-only) |
-| 1.2 | Compare quality: TurboQuantProd(4-bit=3MSE+1QJL) vs TurboQuantMSE(4-bit) | Cosine similarity, token match |
-| 1.3 | Verify `estimate_inner_product` matches standard Q@K^T on decompressed keys | Per-layer cosine >0.998 |
+**Q6: What's the bandwidth-bound crossover?**
+- P5 reads 68 bytes/token (TQ4) vs 256 bytes/token (fp16). At some sequence length, bandwidth dominates compute.
+- We tested at 17 and 1205 tokens — fused was slower at both. What about 5K, 11K, 50K?
+- **Action:** Benchmark at 5K+ token sequences to find the crossover point.
 
-**Risk:** TurboQuantProd uses 3-bit MSE (8 centroids) instead of 4-bit (16 centroids). The QJL correction should compensate for inner product estimation, but reconstruction quality may be lower. Experiment 001 showed garbled output with TurboQuantProd in drop-in mode — but P9 uses `estimate_inner_product`, not drop-in dequant.
+#### Two Paths Forward (choose after research)
 
-#### Phase 2: Fused inner-product kernel (2-3 days)
+**Path A: Optimize P5 dequant-then-dot kernel**
+- Our P5 kernel is correct across 36 layers (>0.998 cosine, coherent output)
+- Profile with Nsight Compute, tune block sizes, reduce register pressure
+- Target: beat unfused path (currently 0.62x) at long sequences
+- If the paper's 8x is vs FP32 (not vs cuDNN FA), P5 may already match
 
-| Step | Action | Validation |
-|------|--------|------------|
-| 2.1 | New Triton kernel: MSE dot product directly from indices (no dequant) | Cosine >0.998 vs unfused |
-| 2.2 | Add QJL correction term inside kernel | Combined score matches `estimate_inner_product` |
-| 2.3 | Integrate with FA online softmax (same `(m_i, l_i, acc)` state machine) | 36-layer composition >0.93 |
-| 2.4 | V tiles use MSE-only dequant (same as P5 Phase 3) or separate path | Output matches reference |
+**Path B: Fix QJL precision for Molmo2**
+- Investigate why QJL fails at 0.847-0.971 cosine on Molmo2
+- May need: higher qjl_dim, different scaling, model-specific tuning
+- If fixable, `estimate_inner_product` in FA would give maximum bandwidth savings
 
-**Key kernel design:**
-```
-# Pre-compute outside kernel:
-q_rot = q @ Pi_mse^T              # Pre-rotate for MSE term (already proven in P5)
-q_proj = q @ S^T                  # Pre-project for QJL term (new)
+**Path C: Hybrid — MSE dequant for K, direct sign-dot for QJL correction**
+- Use P5's centroid gather for the MSE term (proven high precision)
+- Add QJL correction ON TOP as a lightweight delta (few extra bytes, minimal compute)
+- Gets both high precision AND the QJL inner-product improvement
+- Needs validation that the combined approach holds >0.998 cosine
 
-# Inside FA inner loop, for each K tile:
-# MSE term: dot product from compressed indices (no full dequant)
-mse_score = norm * sum_d(q_rot[d] * centroids_3bit[idx[d]])
+### P7: vLLM integration (after speed gap closed)
 
-# QJL term: correction from sign bits
-qjl_score = res_norm * sqrt(pi/2) / m * sum_j(q_proj[j] * signs[j])
+**Goal:** Run TurboQuant as a vLLM KV cache backend with compression AND speed.
 
-# Combined attention score
-score = mse_score + qjl_score
+**Approach:** Custom PagedAttention backend that reads compressed KV pages directly. Either contribute upstream or fork vLLM's attention module.
 
-# Feed into online softmax as before (proven stable in P5)
-```
-
-#### Phase 3: 3-bit packing for indices (1-2 days)
-
-| Step | Action | Validation |
-|------|--------|------------|
-| 3.1 | Implement 3-bit byte-crossing pack/unpack in Triton | Round-trip correctness |
-| 3.2 | Integrate into kernel (replace uint8 index load) | Same output, smaller reads |
-| 3.3 | Pack QJL signs as bit-packed uint8 (128 bits = 16 bytes) | Already efficient |
-
-This reduces key storage from 152 bytes (uint8) to 72 bytes (bit-packed) per position. Combined with V at 68 bytes, total KV = 140 bytes vs 512 FP16 = **3.66x compression with speed.**
-
-#### Phase 4: Profile and optimize (1-2 days)
-
-| Step | Action | Validation |
-|------|--------|------------|
-| 4.1 | Nsight Compute profiling of P9 kernel vs cuDNN FA | Identify bottleneck |
-| 4.2 | Tune autotune configs for RTX 4090 (SM89) | Peak achieved bandwidth |
-| 4.3 | Benchmark at 1K, 5K, 11K token sequences | Find crossover point |
-| 4.4 | Compare vs paper's claimed 8x (adjusting for H100→4090 bandwidth ratio) | Realistic target for consumer GPU |
-
-**RTX 4090 vs H100 bandwidth:** 1008 GB/s vs 3350 GB/s (3.3x gap). The paper's 8x on H100 might translate to ~2.5-4x on RTX 4090 — still a significant win if the kernel is bandwidth-bound.
-
-#### Phase 5: E2E Molmo2 validation + vLLM integration
-
-| Step | Action | Validation |
-|------|--------|------------|
-| 5.1 | E2E experiment: SDPA vs unfused TQ4 vs P9 fused on Molmo2-4B | All three produce coherent output |
-| 5.2 | Throughput comparison at video-scale (11K+ tokens) | Fused >= unfused AND >= 1.5x vs SDPA at long sequences |
-| 5.3 | vLLM custom attention backend (PagedAttention + TurboQuantProd) | Serve Molmo2-8B with TQ KV cache |
-| 5.4 | Production benchmark: max_model_len with TQ vs FP8 | 3x+ context window at equal or better throughput |
-
-**Success criteria (north star):**
-- KV compression: >=3.5x vs FP16 (matching paper)
-- Attention speedup: >= 1.5x vs baseline at 11K+ tokens on RTX 4090
-- Text quality: coherent output, character names preserved on Molmo2-8B
-- max_model_len: 3x increase in vLLM serving
-
-### P6: TQ3 bit-packing (folded into P9 Phase 3)
-
-Now part of P9 Phase 3. Required for the paper-faithful storage format.
-
-### P7: vLLM native integration (folded into P9 Phase 5)
-
-Now part of P9 Phase 5. No longer "monitor upstream" — we build it.
+**Prerequisite:** P9 research resolves the speed question — whether via P5 kernel optimization or QJL fix. Don't integrate until we have the target throughput.
 
 ---
 
@@ -574,6 +531,8 @@ Now part of P9 Phase 5. No longer "monitor upstream" — we build it.
 
 8. **No existing system fuses codebook VQ with Flash Attention.** Survey of 13 quantized attention implementations (KIVI, BitDecoding, Kitty, QServe, FlashInfer, etc.) found they all use scalar quantization (INT2/4/8, FP4/8). TurboQuant's vector quantization codebook lookup is architecturally different and requires a novel kernel design.
 
-9. **Dequant-then-dot is the wrong architecture for speed.** P5 proved full FA fusion prevents precision collapse across 36 layers. But dequanting K inside the inner loop (centroid gather → 128 floats → Q@K^T) is slower than cuDNN's optimized FA reading fp16 directly. The paper achieves speedup by computing Q@K^T directly from compressed indices via `estimate_inner_product` — never materializing the full key vector. This requires TurboQuantProd (MSE+QJL), not TurboQuantMSE.
+9. **Dequant-then-dot may not be the wrong architecture after all.** P5 dequant-then-dot is slower than cuDNN FA but produces >0.999 cosine across 36 layers. The paper's `estimate_inner_product` (avoiding dequant) was expected to be faster, but experiment 012 showed it fails on Molmo2 (0.847-0.971 cosine → garbled output). Until the QJL precision gap is understood, P5's architecture is the only one that actually works.
 
-10. **Key Lesson #2 was context-dependent.** "QJL is invisible in drop-in mode" is true for drop-in cache replacement (standard attention on decompressed keys). But QJL is essential for the paper's speed claim — it enables `estimate_inner_product` which avoids full dequantization. The fused kernel for speed must use TurboQuantProd, not TurboQuantMSE.
+10. **QJL noise compounds catastrophically across layers.** `estimate_inner_product` adds per-score noise from the 1-bit QJL correction (~0.15 cosine loss at layer 0). Through 36 layers of residual connections + layer norms, this compounds to garbled output. Tested at 4-bit (0.847), 5-bit (0.928), and 6-bit (0.971) — none produced coherent text on Molmo2-4B. The paper claims this works on Gemma/Mistral — the difference may be model architecture, evaluation methodology, or implementation details we're missing.
+
+11. **Paper speedup baselines matter.** The paper claims "8x speedup in computing attention logits (4-bit vs 32-bit baseline)." FP32 baseline is NOT cuDNN Flash Attention — it's naive FP32 attention. Our P5 kernel may already match the paper's speed claim vs FP32 while being slower than cuDNN FA. We haven't benchmarked vs FP32 yet.
