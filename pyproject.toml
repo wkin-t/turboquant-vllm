@@ -69,6 +69,48 @@ tq4_backend = "turboquant_vllm.vllm:register_tq4_backend"
 requires = ["uv_build>=0.11.1,<0.12.0"]
 build-backend = "uv_build"
 
+# --------------------------------------------------------------------------- #
+# import-linter
+# --------------------------------------------------------------------------- #
+[tool.importlinter]
+root_package = "turboquant_vllm"
+
+[[tool.importlinter.contracts]]
+name = "Core module layers"
+type = "layers"
+layers = [
+    "turboquant_vllm.benchmark",
+    "turboquant_vllm.kv_cache",
+    "turboquant_vllm.compressors",
+    "turboquant_vllm.quantizer",
+    "turboquant_vllm.lloyd_max",
+]
+
+[[tool.importlinter.contracts]]
+name = "Triton must not import kv_cache"
+type = "forbidden"
+source_modules = ["turboquant_vllm.triton"]
+forbidden_modules = ["turboquant_vllm.kv_cache", "turboquant_vllm.benchmark"]
+ignore_imports = [
+    # TYPE_CHECKING-only import for type hints, not runtime
+    "turboquant_vllm.triton.attention_interface -> turboquant_vllm.kv_cache",
+]
+
+[[tool.importlinter.contracts]]
+name = "vLLM must not leak into core or triton"
+type = "forbidden"
+source_modules = [
+    "turboquant_vllm.lloyd_max",
+    "turboquant_vllm.quantizer",
+    "turboquant_vllm.compressors",
+    "turboquant_vllm.kv_cache",
+    "turboquant_vllm.triton",
+]
+forbidden_modules = ["turboquant_vllm.vllm"]
+
+# --------------------------------------------------------------------------- #
+# ruff
+# --------------------------------------------------------------------------- #
 [tool.ruff]
 line-length = 88
 target-version = "py312"
@@ -156,5 +198,6 @@ dev = [
     "pytest-randomly>=4.0",
     "ruff>=0.15",
     "ty>=0.0.1a33",
+    "import-linter>=2.11",
     "uv-secure>=0.17.0",
 ]
