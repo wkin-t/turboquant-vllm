@@ -89,6 +89,23 @@ def _tq4_bytes_per_token(head_dim: int, bits: int = TQ4_BITS) -> int:
     return _packed_index_size(bits, head_dim) + TQ4_NORM_BYTES
 
 
+def _padded_slot_bytes(head_dim: int) -> int:
+    """Padded slot size for hybrid model page alignment.
+
+    Returns ``next_power_of_2(raw_slot)`` to ensure TQ4 pages are
+    divisible by Mamba layer pages in hybrid models (e.g. Qwen3.5).
+
+    Args:
+        head_dim: Dimension of each attention head.
+
+    Returns:
+        Power-of-2 padded byte count per token per KV head.
+    """
+    from vllm.utils.math_utils import next_power_of_2
+
+    return next_power_of_2(_tq4_bytes_per_token_kv(head_dim))
+
+
 def _tq4_bytes_per_token_kv(
     head_dim: int, k_bits: int = TQ4_BITS, v_bits: int = TQ4_BITS
 ) -> int:
@@ -216,13 +233,9 @@ class TQ4FullAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:  # noqa: D102
-        # Triton kernels always nibble-pack, so page size is independent of
-        # bit-width (different codebook sizes don't change storage layout).
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * _tq4_bytes_per_token_kv(self.head_size)
-        )
+        # Padded slot ensures page-size divisibility with Mamba layers
+        # in hybrid models (Qwen3.5). Padding bytes are unused by kernels.
+        return self.block_size * self.num_kv_heads * _padded_slot_bytes(self.head_size)
 
 
 # ---------------------------------------------------------------------------
@@ -303,12 +316,14 @@ class TQ4AttentionBackend(FlashAttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        """Packed TQ4 cache: ``(num_blocks, block_size, total_bytes)``.
+        """Packed TQ4 cache: ``(num_blocks, block_size, padded_bytes)``.
 
-        The last dimension packs K and V data for all heads as raw bytes:
-        ``[K_indices | K_norms | V_indices | V_norms]``.
+        The last dimension packs K and V data for all heads as raw bytes
+        with padding for hybrid model page alignment. Only the first
+        ``num_kv_heads * _tq4_bytes_per_token_kv(head_size)`` bytes per
+        token contain packed data; trailing bytes are unused padding.
         """
-        total_bytes = num_kv_heads * _tq4_bytes_per_token_kv(head_size)
+        total_bytes = num_kv_heads * _padded_slot_bytes(head_size)
         return (num_blocks, block_size, total_bytes)
 
     @staticmethod
@@ -559,7 +574,8 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         Args:
             key: ``(N, H, D)`` new key tokens.
             value: ``(N, H, D)`` new value tokens.
-            kv_cache: ``(NB, BS, total_bytes)`` uint8 packed cache.
+            kv_cache: ``(NB, BS, padded_bytes)`` uint8 packed cache.
+                Only ``[:, :, :_total_bytes]`` contains packed data.
             slot_mapping: ``(num_actual_tokens,)`` flat slot indices.
             compress_out: Optional pre-allocated ``(packed, norms)`` buffers
                 for tq4_compress (D7 CUDA graph decode path).
@@ -600,10 +616,12 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         row[:, self._k_norm_end : self._v_idx_end] = v_packed.reshape(N, -1)
         row[:, self._v_idx_end :] = v_norms.reshape(N, H).contiguous().view(torch.uint8)
 
-        # Scatter-write to flat cache using slot_mapping
+        # Scatter-write to flat cache using slot_mapping.
+        # Cache may be padded (hybrid model alignment), so use actual
+        # last dim and write only the packed data columns.
         num_actual = slot_mapping.shape[0]
-        flat_cache = kv_cache.view(-1, self._total_bytes)
-        flat_cache[slot_mapping[:num_actual]] = row[:num_actual]
+        flat_cache = kv_cache.view(-1, kv_cache.shape[-1])
+        flat_cache[slot_mapping[:num_actual], : self._total_bytes] = row[:num_actual]
 
     def _decompress_cache(
         self,
@@ -623,7 +641,8 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         compatibility with tests.
 
         Args:
-            kv_cache: ``(NB, BS, total_bytes)`` uint8 packed cache.
+            kv_cache: ``(NB, BS, padded_bytes)`` uint8 packed cache.
+                Only ``[:, :, :_total_bytes]`` contains packed data.
             compute_dtype: Output dtype (e.g., ``torch.bfloat16``).
             apply_rotation: If ``True`` (default), apply unrotation to
                 return tensors in original space.  ``False`` returns
@@ -643,7 +662,7 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         v_idx_size = self._v_idx_size
         D = self.head_size
 
-        flat = kv_cache.reshape(NB * BS, self._total_bytes)
+        flat = kv_cache.reshape(NB * BS, -1)
 
         # Extract K regions
         k_packed = flat[:, : self._k_idx_end].contiguous().reshape(-1, H, k_idx_size)
@@ -661,7 +680,7 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             .reshape(-1, H, v_idx_size)
         )
         v_norms = (
-            flat[:, self._v_idx_end :]
+            flat[:, self._v_idx_end : self._total_bytes]
             .contiguous()
             .view(torch.float32)
             .reshape(-1, H, 1)
@@ -703,7 +722,8 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         and returns a remapped block table for Flash Attention.
 
         Args:
-            kv_cache: ``(NB, BS, total_bytes)`` uint8 packed cache.
+            kv_cache: ``(NB, BS, padded_bytes)`` uint8 packed cache.
+                Only ``[:, :, :_total_bytes]`` contains packed data.
             block_table: ``(batch, max_blocks_per_seq)`` int32 block table.
             seq_lens: ``(batch,)`` int32 sequence lengths.
             compute_dtype: Output dtype (e.g., ``torch.bfloat16``).
@@ -754,8 +774,8 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             v_buf = torch.empty_like(k_buf)
 
         # Gather referenced blocks and decompress
-        selected = kv_cache[unique_blocks]  # (num_unique, BS, total_bytes)
-        flat = selected.reshape(num_unique * BS, self._total_bytes)
+        selected = kv_cache[unique_blocks]  # (num_unique, BS, padded_bytes)
+        flat = selected.reshape(num_unique * BS, -1)
 
         k_packed = flat[:, : self._k_idx_end].contiguous().reshape(-1, H, k_idx_size)
         k_norms = (
@@ -770,7 +790,7 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             .reshape(-1, H, v_idx_size)
         )
         v_norms = (
-            flat[:, self._v_idx_end :]
+            flat[:, self._v_idx_end : self._total_bytes]
             .contiguous()
             .view(torch.float32)
             .reshape(-1, H, 1)

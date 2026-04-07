@@ -24,7 +24,6 @@ from turboquant_vllm.vllm.tq4_backend import (  # noqa: E402
     TQ4AttentionBackend,
     TQ4AttentionImpl,
     _tq4_bytes_per_token,
-    _tq4_bytes_per_token_kv,
     register_tq4_backend,
 )
 
@@ -115,16 +114,21 @@ class TestTQ4AttentionBackend:
         assert TQ4AttentionBackend.supports_mm_prefix() is True
 
     def test_packed_kv_cache_shape(self) -> None:
-        """Phase 3c: packed uint8 layout (NB, BS, total_bytes)."""
+        """Phase 3c: packed uint8 layout (NB, BS, padded_bytes).
+
+        Padded slot: next_power_of_2(136) = 256. Total = 8 * 256 = 2048.
+        """
+        from turboquant_vllm.vllm.tq4_backend import _padded_slot_bytes
+
         shape = TQ4AttentionBackend.get_kv_cache_shape(
             num_blocks=100,
             block_size=16,
             num_kv_heads=8,
             head_size=128,
         )
-        expected_bytes = 8 * _tq4_bytes_per_token_kv(128)  # 8 * 136 = 1088
+        expected_bytes = 8 * _padded_slot_bytes(128)  # 8 * 256 = 2048
         assert shape == (100, 16, expected_bytes)
-        assert expected_bytes == 1088
+        assert expected_bytes == 2048
 
     def test_packed_shape_not_5d(self) -> None:
         """Phase 3c shape is 3D, not the standard 5D."""
