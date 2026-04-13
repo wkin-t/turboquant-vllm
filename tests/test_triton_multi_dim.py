@@ -17,7 +17,7 @@ from turboquant_vllm.quantizer import TurboQuantMSE
 pytestmark = [pytest.mark.gpu]
 
 
-@pytest.fixture(params=[64, 96, 128], ids=["dim64", "dim96", "dim128"], scope="module")
+@pytest.fixture(params=[64, 96, 128, 256, 512], ids=["dim64", "dim96", "dim128", "dim256", "dim512"], scope="module")
 def multi_dim_quantizer(request: pytest.FixtureRequest) -> TurboQuantMSE:
     """Quantizer at various head_dims for multi-dim Triton validation."""
     return TurboQuantMSE(request.param, 4, seed=42)
