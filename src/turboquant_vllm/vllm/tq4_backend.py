@@ -375,6 +375,23 @@ class TQ4AttentionBackend(FlashAttentionBackend):
 # ---------------------------------------------------------------------------
 
 
+
+# ---------------------------------------------------------------------------
+# Shared scratch buffer registry for enforce-eager (non-CG) mode.
+# In eager mode, transformer layers execute sequentially, so decompress
+# buffers from layer i are no longer live when layer i+1 runs.  All layers
+# with the same (num_kv_heads, head_size) shape share a single pair of
+# buffers, reducing scratch VRAM from O(num_layers) to O(unique_shapes).
+#
+# Keys: (device_str, compute_dtype, num_kv_heads, head_size)
+# Values: (k_tensor, v_tensor)
+#
+# NOT used when CUDA graphs are enabled — graph capture records tensor
+# addresses, so all layer buffers must be independently addressable.
+# ---------------------------------------------------------------------------
+_TQ4_SHARED_DECOMPRESS_BUFS: dict[tuple, tuple["torch.Tensor", "torch.Tensor"]] = {}
+_TQ4_SHARED_PREFILL_BUFS: dict[tuple, tuple["torch.Tensor", "torch.Tensor"]] = {}
+
 class TQ4AttentionImpl(FlashAttentionImpl):
     """TQ4 attention: compress -> store -> decompress -> Flash Attention.
 
@@ -486,6 +503,16 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             vllm_config.model_config.max_model_len if vllm_config is not None else 6144
         )
 
+        # Shared scratch buffers in enforce-eager mode: since layers execute
+        # sequentially, buffers for layer i are free when layer i+1 starts.
+        # Sharing reduces scratch VRAM from O(num_layers) to O(unique_shapes).
+        # CUDA graph mode requires independent per-layer buffers (graph records
+        # addresses), so sharing is disabled when enforce_eager is False.
+        self._use_shared_buffers = (
+            vllm_config is not None
+            and getattr(vllm_config.model_config, "enforce_eager", False)
+        )
+
         logger.info(
             "TQ4AttentionImpl: %d KV heads, head_size=%d, k_bits=%d, v_bits=%d, "
             "%d bytes/token (%.2fx compression vs FP16)",
@@ -503,6 +530,10 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         logger.info(
             "INT8 prefill path: %s",
             "enabled" if self._int8_prefill_available else "disabled",
+        )
+        logger.info(
+            "TQ4 shared scratch buffers: %s",
+            "enabled (enforce-eager)" if self._use_shared_buffers else "disabled (CG mode)",
         )
 
         # SDPA fallback for head_dim > FA2 limit (e.g. Gemma 4 global layers
@@ -525,6 +556,16 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         capture.  Uses max-size + slicing (D7 pattern), NOT per-batch
         allocations.
 
+        In enforce-eager mode, decompress/prefill buffers are shared across
+        all layers with the same (num_kv_heads, head_size) shape via the
+        module-level ``_TQ4_SHARED_*`` registries.  Transformer layers run
+        sequentially, so their buffers are never live simultaneously — this
+        reduces scratch VRAM from O(num_layers) to O(unique_shapes).
+
+        SWA layers only attend to the last ``sliding_window`` tokens, so their
+        decompress buffer is capped at ``min(sliding_window, max_model_len)``
+        rather than the full ``max_model_len``, saving additional VRAM.
+
         Args:
             kv_cache: ``(num_blocks, block_size, total_bytes)`` uint8 cache.
             compute_dtype: Model compute dtype (e.g. ``torch.bfloat16``).
@@ -535,22 +576,56 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         H = self.num_kv_heads
         D = self.head_size
 
-        # Decompress buffers: bounded by max_model_len so the paged
-        # decompress path never allocates full-cache-sized FP16 tensors.
-        decompress_tokens = min(self._max_model_len, max_tokens)
-
-        self._cg_decompress_k = torch.empty(
-            decompress_tokens, H, D, dtype=compute_dtype, device=device
+        # SWA layers only attend to the last ``sliding_window`` tokens; cap the
+        # decompress buffer to that window size.  Global attention layers have
+        # sliding_window=None or 0 and use the full max_model_len.
+        sliding_window = getattr(self, "sliding_window", None)
+        effective_max = (
+            min(sliding_window, self._max_model_len)
+            if (sliding_window is not None and sliding_window > 0)
+            else self._max_model_len
         )
-        self._cg_decompress_v = torch.empty_like(self._cg_decompress_k)
+        decompress_tokens = min(effective_max, max_tokens)
 
-        # Prefill scratch buffers: bounded by max_prefill_len so the paged
-        # decompress path never allocates full-cache-sized FP16 tensors.
+        # --- Decompress buffers (decode path) ---
+        if self._use_shared_buffers:
+            buf_key = (str(device), compute_dtype, H, D)
+            existing = _TQ4_SHARED_DECOMPRESS_BUFS.get(buf_key)
+            if existing is None or existing[0].shape[0] < decompress_tokens:
+                k = torch.empty(
+                    decompress_tokens, H, D, dtype=compute_dtype, device=device
+                )
+                v = torch.empty_like(k)
+                _TQ4_SHARED_DECOMPRESS_BUFS[buf_key] = (k, v)
+            self._cg_decompress_k, self._cg_decompress_v = (
+                _TQ4_SHARED_DECOMPRESS_BUFS[buf_key]
+            )
+        else:
+            self._cg_decompress_k = torch.empty(
+                decompress_tokens, H, D, dtype=compute_dtype, device=device
+            )
+            self._cg_decompress_v = torch.empty_like(self._cg_decompress_k)
+
+        # --- Prefill scratch buffers ---
         prefill_tokens = min(self._max_prefill_len, max_tokens)
-        self._cg_prefill_k = torch.empty(
-            prefill_tokens, H, D, dtype=compute_dtype, device=device
-        )
-        self._cg_prefill_v = torch.empty_like(self._cg_prefill_k)
+        if self._use_shared_buffers:
+            pfill_key = (str(device), compute_dtype, H, D, "prefill")
+            existing = _TQ4_SHARED_PREFILL_BUFS.get(pfill_key)
+            if existing is None or existing[0].shape[0] < prefill_tokens:
+                k = torch.empty(
+                    prefill_tokens, H, D, dtype=compute_dtype, device=device
+                )
+                v = torch.empty_like(k)
+                _TQ4_SHARED_PREFILL_BUFS[pfill_key] = (k, v)
+            self._cg_prefill_k, self._cg_prefill_v = (
+                _TQ4_SHARED_PREFILL_BUFS[pfill_key]
+            )
+        else:
+            self._cg_prefill_k = torch.empty(
+                prefill_tokens, H, D, dtype=compute_dtype, device=device
+            )
+            self._cg_prefill_v = torch.empty_like(self._cg_prefill_k)
+
         self._max_prefill_blocks = prefill_tokens // block_size
 
         # Compress output buffers for one decode step (single token).
@@ -580,14 +655,22 @@ class TQ4AttentionImpl(FlashAttentionImpl):
 
         self._cg_buffers_ready = True
         dtype_bytes = self._cg_decompress_k.element_size()
+        shared_tag = " [shared]" if self._use_shared_buffers else ""
+        swa_tag = (
+            f" [SWA-capped={sliding_window}]"
+            if (sliding_window is not None and sliding_window > 0)
+            else ""
+        )
         prefill_mib = prefill_tokens * H * D * dtype_bytes / (1024 * 1024)
         logger.info(
-            "TQ4 CUDA graph buffers allocated: decompress=%s "
-            "(tokens=%d, source=max_model_len), "
-            "decompress=2×%.1f MiB, prefill=%s (2×%.1f MiB, %d blocks), "
+            "TQ4 CUDA graph buffers allocated: decompress=%s"
+            " (tokens=%d%s%s, 2×%.1f MiB), "
+            "prefill=%s (2×%.1f MiB, %d blocks), "
             "compress+row+q_rot=%.1f KiB",
             self._cg_decompress_k.shape,
             decompress_tokens,
+            swa_tag,
+            shared_tag,
             decompress_tokens * H * D * dtype_bytes / (1024 * 1024),
             self._cg_prefill_k.shape,
             prefill_mib,
