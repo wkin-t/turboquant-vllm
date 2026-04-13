@@ -31,6 +31,7 @@ from turboquant_vllm.vllm.tq4_backend import (
     TQ4AttentionBackend,
     TQ4AttentionImpl,
     TQ4FullAttentionSpec,
+    TQ4SlidingWindowSpec,
     register_tq4_backend,
 )
 
@@ -38,5 +39,6 @@ __all__ = [
     "TQ4AttentionBackend",
     "TQ4AttentionImpl",
     "TQ4FullAttentionSpec",
+    "TQ4SlidingWindowSpec",
     "register_tq4_backend",
 ]

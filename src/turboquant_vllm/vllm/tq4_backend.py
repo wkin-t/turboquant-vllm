@@ -34,7 +34,7 @@ from vllm.v1.attention.backends.registry import (
     AttentionBackendEnum,
     register_backend,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from turboquant_vllm.quantizer import TurboQuantMSE
 from turboquant_vllm.triton.tq4_compress import tq4_compress
@@ -235,6 +235,21 @@ class TQ4FullAttentionSpec(FullAttentionSpec):
     def real_page_size_bytes(self) -> int:  # noqa: D102
         # Padded slot ensures page-size divisibility with Mamba layers
         # in hybrid models (Qwen3.5). Padding bytes are unused by kernels.
+        return self.block_size * self.num_kv_heads * _padded_slot_bytes(self.head_size)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TQ4SlidingWindowSpec(SlidingWindowSpec):
+    """KV cache spec for sliding-window layers with TQ4 packed page size.
+
+    Mirrors :class:`TQ4FullAttentionSpec` but inherits from
+    ``SlidingWindowSpec`` so the monkey-patch in
+    :func:`register_tq4_backend` covers models that mix full and
+    sliding-window attention (e.g. Gemma 4).
+    """
+
+    @property
+    def real_page_size_bytes(self) -> int:  # noqa: D102
         return self.block_size * self.num_kv_heads * _padded_slot_bytes(self.head_size)
 
 
@@ -1116,8 +1131,9 @@ def register_tq4_backend() -> None:
 
     In addition to registering the backend class, this monkey-patches
     ``Attention.get_kv_cache_spec`` so that decoder attention layers
-    return :class:`TQ4FullAttentionSpec` (with ``dtype=torch.uint8``
-    and TQ4-sized pages) instead of the standard ``FullAttentionSpec``.
+    return :class:`TQ4FullAttentionSpec` or :class:`TQ4SlidingWindowSpec`
+    (with ``dtype=torch.uint8`` and TQ4-sized pages) instead of the
+    standard ``FullAttentionSpec`` / ``SlidingWindowSpec``.
 
     Called automatically by the ``vllm.general_plugins`` entry point,
     or manually before starting vLLM::
@@ -1134,13 +1150,16 @@ def register_tq4_backend() -> None:
         "turboquant_vllm.vllm.tq4_backend.TQ4AttentionBackend",
     )
 
-    # Register TQ4FullAttentionSpec in the KV cache manager mapping.
+    # Register TQ4 specs in the KV cache manager mapping.
     # vLLM uses exact type() match, not isinstance(), so subclasses
-    # of FullAttentionSpec must be explicitly added.
+    # of FullAttentionSpec / SlidingWindowSpec must be explicitly added.
     from vllm.v1.core.single_type_kv_cache_manager import spec_manager_map
 
     if TQ4FullAttentionSpec not in spec_manager_map:
         spec_manager_map[TQ4FullAttentionSpec] = spec_manager_map[FullAttentionSpec]
+
+    if TQ4SlidingWindowSpec not in spec_manager_map:
+        spec_manager_map[TQ4SlidingWindowSpec] = spec_manager_map[SlidingWindowSpec]
 
     # Monkey-patch Attention.get_kv_cache_spec to return TQ4 spec
     from vllm.model_executor.layers.attention.attention import Attention
@@ -1156,6 +1175,12 @@ def register_tq4_backend() -> None:
             kwargs = {f.name: getattr(spec, f.name) for f in dc_fields(spec)}
             kwargs["dtype"] = torch.uint8
             return TQ4FullAttentionSpec(**kwargs)
+        if isinstance(spec, SlidingWindowSpec) and not isinstance(
+            spec, TQ4SlidingWindowSpec
+        ):
+            kwargs = {f.name: getattr(spec, f.name) for f in dc_fields(spec)}
+            kwargs["dtype"] = torch.uint8
+            return TQ4SlidingWindowSpec(**kwargs)
         return spec
 
     Attention.get_kv_cache_spec = _tq4_get_kv_cache_spec
