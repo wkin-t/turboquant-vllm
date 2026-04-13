@@ -60,6 +60,10 @@ TQ4_SEED = 42
 # For head_dim=128: 64 + 4 = 68 bytes vs 256 bytes FP16 = 3.76x compression
 TQ4_NORM_BYTES = 4  # fp32
 
+# FlashAttention 2 hard limit on head dimension (SM89 Ada / SM80 Ampere).
+# Layers with head_dim > this use PyTorch SDPA fallback.
+_FA2_MAX_HEAD_DIM = 256
+
 
 def _packed_index_size(bits: int, head_dim: int) -> int:
     """Index byte count for one token/head: nibble-packed at 4-bit, else unpacked.
@@ -500,6 +504,17 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             "INT8 prefill path: %s",
             "enabled" if self._int8_prefill_available else "disabled",
         )
+
+        # SDPA fallback for head_dim > FA2 limit (e.g. Gemma 4 global layers
+        # with head_dim=512 on SM89 where only FA2 is available).
+        self._use_sdpa_fallback = self.head_size > _FA2_MAX_HEAD_DIM
+        if self._use_sdpa_fallback:
+            logger.info(
+                "TQ4: head_size=%d > %d (FA2 limit), using PyTorch SDPA "
+                "fallback for attention computation",
+                self.head_size,
+                _FA2_MAX_HEAD_DIM,
+            )
 
     def _init_cg_buffers(
         self, kv_cache: torch.Tensor, compute_dtype: torch.dtype
@@ -982,6 +997,99 @@ class TQ4AttentionImpl(FlashAttentionImpl):
 
         return output
 
+    # ----- SDPA fallback for head_dim > FA2 limit -----
+
+    def _sdpa_varlen_attention(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata,
+    ) -> None:
+        """SDPA fallback for head_dim > FA2 limit (e.g. 512).
+
+        Gathers per-sequence KV from paged block layout and calls
+        ``torch.nn.functional.scaled_dot_product_attention`` per sequence.
+        Slower than FlashAttention but supports arbitrary head dimensions.
+
+        Args:
+            q: ``(num_actual_tokens, num_heads, head_size)`` rotated query.
+            key_cache: ``(num_compact_blocks, block_size, num_kv_heads, head_size)``.
+            value_cache: same shape as key_cache.
+            block_table: ``(batch_size, max_blocks_per_seq)`` remapped indices.
+            output: ``(num_actual_tokens, num_heads, head_size)`` output buffer.
+            attn_metadata: Attention metadata with query_start_loc, seq_lens.
+        """
+        import torch.nn.functional as F
+
+        query_start_loc = attn_metadata.query_start_loc
+        seq_lens = attn_metadata.seq_lens
+        block_size = key_cache.shape[1]
+        batch_size = seq_lens.shape[0]
+        is_causal = attn_metadata.causal
+        has_softcap = self.logits_soft_cap > 0
+
+        for i in range(batch_size):
+            q_start = query_start_loc[i].item()
+            q_end = query_start_loc[i + 1].item()
+            q_len = q_end - q_start
+            seq_len = seq_lens[i].item()
+
+            q_seq = q[q_start:q_end]
+
+            num_blocks_needed = (seq_len + block_size - 1) // block_size
+            blk_idx = block_table[i, :num_blocks_needed]
+            k_seq = key_cache[blk_idx].reshape(
+                -1, self.num_kv_heads, self.head_size
+            )[:seq_len]
+            v_seq = value_cache[blk_idx].reshape(
+                -1, self.num_kv_heads, self.head_size
+            )[:seq_len]
+
+            q_4d = q_seq.unsqueeze(0).transpose(1, 2)
+            k_4d = k_seq.unsqueeze(0).transpose(1, 2)
+            v_4d = v_seq.unsqueeze(0).transpose(1, 2)
+
+            if has_softcap:
+                num_groups = self.num_heads // self.num_kv_heads
+                if num_groups > 1:
+                    k_4d = k_4d.repeat_interleave(num_groups, dim=1)
+                    v_4d = v_4d.repeat_interleave(num_groups, dim=1)
+
+                scores = (
+                    torch.matmul(q_4d, k_4d.transpose(-2, -1)) * self.scale
+                )
+                scores = (
+                    torch.tanh(scores / self.logits_soft_cap)
+                    * self.logits_soft_cap
+                )
+
+                if is_causal and q_len > 1:
+                    row_idx = torch.arange(q_len, device=q.device).unsqueeze(1)
+                    col_idx = torch.arange(seq_len, device=q.device).unsqueeze(0)
+                    mask = col_idx <= (row_idx + seq_len - q_len)
+                    scores = scores.masked_fill(
+                        ~mask.unsqueeze(0).unsqueeze(0), float("-inf")
+                    )
+
+                attn_weights = torch.softmax(
+                    scores, dim=-1, dtype=torch.float32
+                ).to(q.dtype)
+                out_seq = torch.matmul(attn_weights, v_4d)
+            else:
+                out_seq = F.scaled_dot_product_attention(
+                    q_4d,
+                    k_4d,
+                    v_4d,
+                    scale=self.scale,
+                    is_causal=is_causal and q_len > 1,
+                    enable_gqa=self.num_heads != self.num_kv_heads,
+                )
+
+            output[q_start:q_end] = out_seq.squeeze(0).transpose(0, 1)
+
     # ----- forward -----
 
     def forward(
@@ -1070,45 +1178,53 @@ class TQ4AttentionImpl(FlashAttentionImpl):
                 query, key, value, kv_cache, attn_metadata
             )
 
-        # Step 4: Run Flash Attention with rotated Q and rotated KV
-        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-
+        # Step 4: Run attention with rotated Q and rotated KV
         if attn_metadata.use_cascade:
             raise NotImplementedError("TQ4 does not yet support cascade attention")
 
-        descale_shape = (
-            attn_metadata.query_start_loc.shape[0] - 1,
-            self.num_kv_heads,
-        )
-        q_descale = layer._q_scale.expand(descale_shape)
-        k_descale = layer._k_scale.expand(descale_shape)
-        v_descale = layer._v_scale.expand(descale_shape)
+        if self._use_sdpa_fallback:
+            # head_dim > FA2 limit -- use PyTorch SDPA
+            self._sdpa_varlen_attention(
+                q_rot, key_cache, value_cache, fa_block_table,
+                output[:num_actual_tokens], attn_metadata,
+            )
+        else:
+            # head_dim <= FA2 limit -- use FlashAttention
+            from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
-        flash_attn_varlen_func(
-            q=q_rot,
-            k=key_cache,
-            v=value_cache,
-            out=output[:num_actual_tokens],
-            cu_seqlens_q=attn_metadata.query_start_loc,
-            max_seqlen_q=attn_metadata.max_query_len,
-            seqused_k=attn_metadata.seq_lens,
-            max_seqlen_k=attn_metadata.max_seq_len,
-            softmax_scale=self.scale,
-            causal=attn_metadata.causal,
-            alibi_slopes=self.alibi_slopes,
-            window_size=list(self.sliding_window)
-            if self.sliding_window is not None
-            else None,
-            block_table=fa_block_table,
-            softcap=self.logits_soft_cap,
-            scheduler_metadata=attn_metadata.scheduler_metadata,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            num_splits=attn_metadata.max_num_splits,
-            s_aux=self.sinks,
-        )
+            descale_shape = (
+                attn_metadata.query_start_loc.shape[0] - 1,
+                self.num_kv_heads,
+            )
+            q_descale = layer._q_scale.expand(descale_shape)
+            k_descale = layer._k_scale.expand(descale_shape)
+            v_descale = layer._v_scale.expand(descale_shape)
+
+            flash_attn_varlen_func(
+                q=q_rot,
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=list(self.sliding_window)
+                if self.sliding_window is not None
+                else None,
+                block_table=fa_block_table,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=self.sinks,
+            )
 
         # Step 5: Post-rotate output by Pi (undo rotation space)
         out_slice = output[:num_actual_tokens]
