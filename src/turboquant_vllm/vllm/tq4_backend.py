@@ -294,6 +294,15 @@ class TQ4AttentionBackend(FlashAttentionBackend):
         return True
 
     @staticmethod
+    def supports_head_size(head_size: int) -> bool:
+        """TQ4 uses its own Triton kernels, not FlashAttention CUDA kernels.
+
+        Only requires head_dim to be even (nibble-packing constraint).
+        Supports head_dim=512 needed by Gemma 4 global attention layers.
+        """
+        return head_size % 2 == 0 and head_size > 0
+
+    @staticmethod
     def get_name() -> str:
         """Must return ``"CUSTOM"`` to match ``AttentionBackendEnum.CUSTOM``."""
         return "CUSTOM"
