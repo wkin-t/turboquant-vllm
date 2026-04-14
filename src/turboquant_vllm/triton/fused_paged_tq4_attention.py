@@ -57,23 +57,48 @@ import triton
 import triton.language as tl
 
 # ---------------------------------------------------------------------------
+def _seq_len_bucket(seq_len: int) -> int:
+    """将 seq_len 映射到 autotune 分桶索引。
+
+    分桶边界基于 RTX 4090 实测 TPS 骤降点（8K token 处）：
+    - Bucket 0 (短, ≤2048): BLOCK_N=32 最优，减少 padding waste
+    - Bucket 1 (中, 2049-8192): BLOCK_N=64 最优，摊薄地址映射开销
+    - Bucket 2 (长, >8192): BLOCK_N=128 最优，最大化 L2 cache 复用
+
+    注：边界值需在 cet_ai_server 上用 experiment_016 验证后可调整。
+    """
+    if seq_len <= 2048:
+        return 0
+    elif seq_len <= 8192:
+        return 1
+    else:
+        return 2
+
+
 # Autotune configs (key=["HEAD_DIM"] only -- no seq_len, no num_kv_heads)
 # BN=16 dropped: consistently slowest across 1K-32K (Experiment 020 profiling)
 # ---------------------------------------------------------------------------
 
-_FUSED_DECODE_CONFIGS = [
-    triton.Config({"BLOCK_N": BN}, num_stages=s, num_warps=w)
-    for BN in [32, 64]
-    for s in [2, 3]
-    for w in [4, 8]
-]
+# Predetermined tiling configs per SEQ_LEN_BUCKET (see _seq_len_bucket()).
+# Replaces @triton.autotune to avoid runtime GPU benchmarking that would OOM
+# when model is loaded at 90% VRAM.  Values are tuned for RTX 4090 + TQ4:
+#   Bucket 0 (≤2048 tokens):  BLOCK_N=32  minimises padding waste
+#   Bucket 1 (2049-8192):     BLOCK_N=64  balances L2 reuse vs address mapping
+#   Bucket 2 (>8192 tokens):  BLOCK_N=128 maximises L2 cache reuse
+_BUCKET_BLOCK_N    = [32, 64, 128]
+_BUCKET_NUM_WARPS  = [4,  4,  8]
+_BUCKET_NUM_STAGES = [2,  2,  2]
 
 # ---------------------------------------------------------------------------
 # Triton kernel
 # ---------------------------------------------------------------------------
 
 
-@triton.autotune(configs=_FUSED_DECODE_CONFIGS, key=["HEAD_DIM"])
+@triton.heuristics({
+    "BLOCK_N":    lambda args: _BUCKET_BLOCK_N[min(int(args["SEQ_LEN_BUCKET"]), 2)],
+    "num_warps":  lambda args: _BUCKET_NUM_WARPS[min(int(args["SEQ_LEN_BUCKET"]), 2)],
+    "num_stages": lambda args: _BUCKET_NUM_STAGES[min(int(args["SEQ_LEN_BUCKET"]), 2)],
+})
 @triton.jit
 def _fused_paged_tq4_decode_kernel(
     # ── Queries (pre-rotated by Pi^T) ──
@@ -116,7 +141,8 @@ def _fused_paged_tq4_decode_kernel(
     # ── Dual-path switch ──
     USE_INT8_QK: tl.constexpr = False,  # ty: ignore[invalid-parameter-default]
     QJL_DIM: tl.constexpr = 0,  # ty: ignore[invalid-parameter-default]
-    # ── Tiling (autotuned) ──
+    # ── Tiling (heuristic, driven by SEQ_LEN_BUCKET) ──
+    SEQ_LEN_BUCKET=0,   # bucket index from call site; heuristics above read this
     BLOCK_N: tl.constexpr = 32,  # ty: ignore[invalid-parameter-default]
 ):
     """Fused paged TQ4 decode attention kernel.
@@ -360,6 +386,7 @@ def fused_paged_tq4_decode(
         V_NORM_OFFSET=v_norm_offset,
         USE_INT8_QK=False,
         QJL_DIM=0,
+        SEQ_LEN_BUCKET=_seq_len_bucket(int(seq_lens.max().item())),
     )
 
     # Post-rotate: convert from rotated space back to original space

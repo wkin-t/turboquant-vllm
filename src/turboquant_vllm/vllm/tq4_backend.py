@@ -94,20 +94,40 @@ def _tq4_bytes_per_token(head_dim: int, bits: int = TQ4_BITS) -> int:
 
 
 def _padded_slot_bytes(head_dim: int) -> int:
-    """Padded slot size for hybrid model page alignment.
+    """Per-head per-token byte count aligned for integer page-size ratios.
 
-    Returns ``next_power_of_2(raw_slot)`` to ensure TQ4 pages are
-    divisible by Mamba layer pages in hybrid models (e.g. Qwen3.5).
+    Replaces ``next_power_of_2`` (which wasted ~49 % of KV cache memory) with
+    a next-multiple-of-264 alignment that wastes < 2 % for Gemma 4.
+
+    Background: vLLM's ``unify_kv_cache_spec_page_size`` requires
+    ``max_page_size % any_page_size == 0``.  With power-of-2 rounding,
+    SWA (512 B/head) and global (1024 B/head) already satisfy ratio=2, but
+    waste 48–49 % of each block.  By switching to the SWA base unit (264 B =
+    ``_tq4_bytes_per_token_kv(256)``), any two sizes are multiples of 264 and
+    keep an integer ratio without the power-of-2 overhead.
+
+    Gemma 4 result::
+
+        head_dim=256 (SWA)  → 264 B/head  (0 % waste, was 48.5 %)
+        head_dim=512 (full) → 528 B/head  (1.5 % waste, was 49.2 %)
+
+    Expected context improvement: ~107 k → ~210 k tokens on RTX 4090.
+
+    NOTE: For models with Mamba layers (e.g. Qwen3.5 MoE) that require
+    power-of-2 alignment, revert to ``next_power_of_2`` by overriding this
+    function.
 
     Args:
         head_dim: Dimension of each attention head.
 
     Returns:
-        Power-of-2 padded byte count per token per KV head.
+        Byte count per token per KV head, aligned for integer page ratios.
     """
-    from vllm.utils.math_utils import next_power_of_2
-
-    return next_power_of_2(_tq4_bytes_per_token_kv(head_dim))
+    actual = _tq4_bytes_per_token_kv(head_dim)
+    # _BASE = _tq4_bytes_per_token_kv(256) = 264 for standard 4-bit TQ4.
+    # Any two multiples of _BASE have an integer ratio.
+    _BASE = 264
+    return (actual + _BASE - 1) // _BASE * _BASE
 
 
 def _tq4_bytes_per_token_kv(
@@ -503,14 +523,21 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             vllm_config.model_config.max_model_len if vllm_config is not None else 6144
         )
 
-        # Shared scratch buffers in enforce-eager mode: since layers execute
-        # sequentially, buffers for layer i are free when layer i+1 starts.
-        # Sharing reduces scratch VRAM from O(num_layers) to O(unique_shapes).
-        # CUDA graph mode requires independent per-layer buffers (graph records
-        # addresses), so sharing is disabled when enforce_eager is False.
-        self._use_shared_buffers = (
-            vllm_config is not None
-            and getattr(vllm_config.model_config, "enforce_eager", False)
+        # Shared scratch buffers: since TQ4 attention is NEVER captured in
+        # CUDAGraphs (AttentionCGSupport.NEVER), the runtime always executes
+        # attention eagerly regardless of cudagraph_mode.  Layers execute
+        # sequentially at runtime, so buffers for layer i are free when
+        # layer i+1 starts — sharing is always safe for TQ4.
+        # This also fixes PIECEWISE CUDAGraph mode: without sharing, each of
+        # the 8 global-attention layers allocates ~440 MB independently
+        # (~3.5 GB total), causing OOM on 24 GB GPUs at max_model_len=107k.
+        self._use_shared_buffers = vllm_config is not None
+        # Thinking 模式检测：reasoning_parser 存在则为 thinking 模型
+        # thinking 请求走 eager 路径避免 CUDAGraph 重捕导致的延迟方差
+        self._is_thinking_model = (
+            getattr(vllm_config, "reasoning_parser", None) is not None
+            if vllm_config is not None
+            else False
         )
 
         logger.info(
@@ -571,6 +598,7 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             compute_dtype: Model compute dtype (e.g. ``torch.bfloat16``).
         """
         num_blocks, block_size, _ = kv_cache.shape
+        self._block_size = block_size
         max_tokens = num_blocks * block_size
         device = kv_cache.device
         H = self.num_kv_heads
@@ -580,6 +608,10 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         # decompress buffer to that window size.  Global attention layers have
         # sliding_window=None or 0 and use the full max_model_len.
         sliding_window = getattr(self, "sliding_window", None)
+        # vLLM ≥0.8 may store sliding_window as a tuple (e.g. Gemma4 SWA layers).
+        # Normalise to a plain int so subsequent comparisons don't TypeError.
+        if isinstance(sliding_window, (tuple, list)):
+            sliding_window = sliding_window[0] if sliding_window else None
         effective_max = (
             min(sliding_window, self._max_model_len)
             if (sliding_window is not None and sliding_window > 0)
@@ -972,10 +1004,57 @@ class TQ4AttentionImpl(FlashAttentionImpl):
         )
         return self._cg_q_rot_cast[:1], key_cache, value_cache, remapped_bt
 
+    def _check_prefill_capacity(self, attn_metadata) -> bool:
+        """检查当前批次 KV 块数是否在静态缓冲区容量以内。
+        True → 可走 TQ4 路径；False → 需 fallback。
+        """
+        block_table = attn_metadata.block_table
+        seq_lens = attn_metadata.seq_lens
+        BS = self._block_size
+
+        blocks_needed = (seq_lens + BS - 1) // BS
+        max_cols = block_table.shape[1]
+        col_idx = torch.arange(max_cols, device=block_table.device)
+        valid_mask = col_idx.unsqueeze(0) < blocks_needed.unsqueeze(1)
+        valid_block_indices = block_table[valid_mask]
+        num_unique = torch.unique(valid_block_indices).numel()
+
+        max_blocks_capacity = self._cg_prefill_k.shape[0] // BS
+        return num_unique <= max_blocks_capacity
+
+    def _fallback_prefill(self, query, key, value, kv_cache, attn_metadata):
+        """容量超出时 fallback 到标准 attention，避免触发大型动态内存分配。"""
+        import logging
+        import torch.nn.functional as F
+        logging.getLogger(__name__).warning(
+            "TQ4 prefill buffer capacity exceeded — falling back to standard "
+            "attention. To fix permanently, see C-medium plan."
+        )
+        # 直接在原始 Q/K/V 上做 scaled_dot_product_attention，
+        # 完全绕过 _decompress_cache_paged 的动态分配路径。
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        q = query[:num_actual_tokens]
+        # 转为 (batch=1, heads, seq, head_dim) 格式
+        q_4d = q.unsqueeze(0).transpose(1, 2)
+        k_4d = key[:num_actual_tokens].unsqueeze(0).transpose(1, 2)
+        v_4d = value[:num_actual_tokens].unsqueeze(0).transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            q_4d, k_4d, v_4d,
+            scale=self.scale,
+            is_causal=True,
+            enable_gqa=self.num_heads != self.num_kv_heads,
+        )
+        # 返回与 _tq4_prefill 相同的四元组格式，后两项置 None 表示无需解压缓存
+        return out.squeeze(0).transpose(0, 1), None, None, None
+
     def _tq4_prefill(
         self, query, key, value, kv_cache, attn_metadata
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prefill path: compress, rotate Q, paged decompress with bounded buffers."""
+        # --- 容量守卫（短期 256K 防崩溃）---
+        if kv_cache is not None and not self._check_prefill_capacity(attn_metadata):
+            return self._fallback_prefill(query, key, value, kv_cache, attn_metadata)
+        # --- 原有逻辑继续（保持原样）---
         num_actual_tokens = attn_metadata.num_actual_tokens
         if kv_cache is not None and key is not None and value is not None:
             self._compress_and_store(key, value, kv_cache, attn_metadata.slot_mapping)
@@ -1231,7 +1310,9 @@ class TQ4AttentionImpl(FlashAttentionImpl):
             self._init_cg_buffers(kv_cache, compute_dtype=query.dtype)
 
         # Steps 1-3: compress, rotate Q, decompress (decode vs prefill path)
-        is_decode = self._cg_buffers_ready and num_actual_tokens == 1
+        # thinking 模式不走 CUDAGraph：thinking 序列长度持续增长会触发图重捕
+        _cg_eligible = self._cg_buffers_ready and not self._is_thinking_model
+        is_decode = _cg_eligible and num_actual_tokens == 1
 
         # Fused paged decode (Story 6.3): single kernel replaces
         # decompress + FlashAttn + post-rotate for decode steps.
